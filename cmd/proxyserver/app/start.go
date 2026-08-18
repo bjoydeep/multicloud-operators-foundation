@@ -129,7 +129,7 @@ func Run(s *options.Options, externalStopCh <-chan struct{}) error {
 	clusterPermissionInformerFactory := clusterpermissioninformers.NewSharedInformerFactory(clusterPermissionClient, 10*time.Minute)
 	clusterPermissionInformer := clusterPermissionInformerFactory.Api().V1alpha1().ClusterPermissions()
 
-	proxyServer, err := NewProxyServer(clusterClient, informerFactory, clusterInformers,
+	proxyServer, err := NewProxyServer(kubeClient, clusterClient, informerFactory, clusterInformers,
 		clusterPermissionInformer.Informer(), clusterPermissionInformer.Lister(),
 		apiServerConfig, proxyGetter, logProxyGetter)
 	if err != nil {

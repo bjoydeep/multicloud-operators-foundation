@@ -1,0 +1,677 @@
+openapi: "3.0.3"
+
+info:
+  title: ACM Multicluster Authorization API
+  version: "0.1.0"
+  description: |
+    Authorization decision endpoints served by `ocm-proxyserver`, implementing a
+    subset of the [AuthZen Authorization API 1.0](https://openid.github.io/authzen/)
+    (OpenID Foundation, July 2026) adapted for the ACM multicluster permission model.
+
+    ## Design context (DDR-083 Phase 3)
+
+    These endpoints promote the unified UserPermission cache from a PIP (Policy
+    Information Point) into a PDP (Policy Decision Point). Instead of fetching raw
+    permission data and building allow/deny logic themselves, clients ask a single
+    question and get a decision.
+
+    The PDP reads from the same in-memory cache as
+    `GET /apis/clusterview.open-cluster-management.io/v1alpha1/userpermissions`.
+    No new data stores or controllers are required.
+
+    ## AuthZen conformance notes
+
+    This API implements a **multicluster profile** of AuthZen Authorization API 1.0.
+    The deviations and extensions reflect the requirements of any AuthZen implementation
+    spanning multiple Kubernetes clusters — not ACM-specific quirks. Callers should not
+    assume full spec conformance. Specific deviations are documented on each endpoint
+    and schema.
+
+    ## Authentication
+
+    All endpoints require a valid bearer token. The `ocm-proxyserver` delegates
+    authentication to the hub kube-apiserver via TokenReview.
+
+    ## Authorization — who can query whom
+
+    Two-path check, evaluated in order:
+
+    **Path 1 — Self-query (no RBAC required):**
+    The caller is querying their own identity.
+    - `subject.type: user` — `subject.id` equals the authenticated user's name
+    - `subject.type: group` — `subject.id` is a group the authenticated user belongs to
+      (as returned by TokenReview)
+
+    This path requires only authentication — no additional RBAC grant needed.
+
+    **Path 2 — Impersonation (cross-subject query):**
+    The caller is querying another subject's permissions. Allowed if the caller holds
+    Kubernetes `impersonate` rights on the target subject, verified via SubjectAccessReview:
+
+    ```
+    can <caller> impersonate users/<subject.id>?   (for subject.type: user)
+    can <caller> impersonate groups/<subject.id>?  (for subject.type: group)
+    ```
+
+    This enables elevated service accounts — Search backend, ACM Console, MCP server —
+    to query permissions on behalf of the logged-in user. Grant impersonation via
+    standard Kubernetes RBAC:
+
+    ```yaml
+    rules:
+    - apiGroups: [""]
+      resources: ["users", "groups"]
+      verbs: ["impersonate"]
+    ```
+
+    **Important — group membership for cross-subject queries:**
+    When an elevated caller queries a user subject (Path 2), the PDP resolves the
+    target user's permissions using only their username — not their group memberships,
+    which are unavailable without an identity provider lookup. Group-inherited permissions
+    will not appear in the result. To query a group's permissions specifically, use
+    `subject.type: group` with the group name.
+
+    Requests that satisfy neither path return `403 Forbidden`.
+
+  contact:
+    name: ACM Foundation Team
+
+servers:
+  - url: https://ocm-proxyserver.multicluster-engine.svc:443
+    description: In-cluster (production consumers)
+  - url: https://localhost:9443
+    description: Local development via kubectl port-forward
+
+paths:
+
+  /.well-known/authzen-configuration:
+    get:
+      summary: AuthZen discovery
+      description: |
+        Returns the URLs of the AuthZen endpoints implemented by this server.
+        Follows the AuthZen `/.well-known/authzen-configuration` discovery convention.
+
+        **AuthZen spec deviation:** The AuthZen spec defines additional discovery
+        fields (e.g. `access_search_subject_v1_endpoint`,
+        `access_search_action_v1_endpoint`). These are omitted because the
+        corresponding endpoints are not yet implemented.
+      operationId: getAuthzenConfiguration
+      responses:
+        "200":
+          description: AuthZen endpoint configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthzenConfiguration"
+              example:
+                access_evaluation_v1_endpoint: /access/v1/evaluation
+                access_evaluations_v1_endpoint: /access/v1/evaluations
+                access_search_resource_v1_endpoint: /access/v1/search/resource
+
+  /access/v1/evaluation:
+    post:
+      summary: Single access evaluation
+      description: |
+        Answers: **can this subject perform this action on this resource?**
+
+        Returns a single boolean `decision`. This is the multicluster equivalent of
+        Kubernetes `SubjectAccessReview`, extended to cover all managed clusters and
+        namespace scopes in a single call.
+
+        The decision is derived from the subject's UserPermission cache entry, which
+        aggregates:
+        - Coarse synthetic roles (`managedcluster:admin`, `managedcluster:view`) from
+          hub RoleBindings/ClusterRoleBindings (adminViewPermissionProcessor)
+        - Fine-grained discoverable roles from MCRA → ClusterPermission resources
+          (discoverablePermissionProcessor)
+
+        **AuthZen spec deviation:** The AuthZen spec includes an optional `context`
+        field (fourth element of SARC). It is not supported in this implementation.
+        The spec also allows `subject.properties` and `action.properties` extensibility
+        bags; these are not supported.
+      operationId: evaluate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EvaluationRequest"
+            examples:
+              get-pods-in-namespace:
+                summary: Can alice GET pods in namespace foo on cluster bar?
+                value:
+                  subject:
+                    type: user
+                    id: alice
+                  action:
+                    name: get
+                  resource:
+                    type: pods
+                    properties:
+                      cluster: bar
+                      namespace: foo
+                      apiGroup: ""
+              create-deployment:
+                summary: Can alice CREATE deployments in namespace default on cluster bar?
+                value:
+                  subject:
+                    type: user
+                    id: alice
+                  action:
+                    name: create
+                  resource:
+                    type: deployments
+                    properties:
+                      cluster: bar
+                      namespace: default
+                      apiGroup: apps
+              group-subject:
+                summary: Does the sre-team group have GET access on cluster bar?
+                value:
+                  subject:
+                    type: group
+                    id: sre-team
+                  action:
+                    name: get
+                  resource:
+                    type: configmaps
+                    properties:
+                      cluster: bar
+                      namespace: default
+                      apiGroup: ""
+      responses:
+        "200":
+          description: Authorization decision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationResponse"
+              examples:
+                allowed:
+                  value:
+                    decision: true
+                denied:
+                  value:
+                    decision: false
+        "400":
+          description: |
+            Bad request. Common causes:
+            - `subject.id` is empty
+            - `resource.properties.cluster` is missing
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          description: No authenticated user found in request context
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          description: |
+            Caller is not authorized to query the specified subject's permissions.
+            Either the caller is not the subject (Path 1 failed) and does not hold
+            Kubernetes impersonate rights on the subject (Path 2 failed).
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /access/v1/evaluations:
+    post:
+      summary: Batch access evaluation
+      description: |
+        Evaluates the same subject and action against multiple resources in a single
+        call. Results are returned in the same order as the input `evaluations` slice.
+
+        **AuthZen spec deviation — request shape:** The AuthZen spec defines
+        `evaluations` as a list of `{action, resource}` pairs, allowing a different
+        action per resource. This implementation uses a single top-level `action`
+        that applies to all resources in the batch — a deliberate simplification for
+        the ACM use case where batch queries typically check the same operation
+        (e.g. "can alice GET each of these resources?").
+
+        **AuthZen spec deviation — executeStrategy:** The AuthZen spec defines an
+        `executeStrategy` field controlling short-circuit semantics
+        (`execute_all`, `deny_on_first_deny`, `permit_on_first_permit`). This is not
+        implemented; the server always evaluates all items and returns all results.
+      operationId: evaluateBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EvaluationsRequest"
+            example:
+              subject:
+                type: user
+                id: alice
+              action:
+                name: get
+              evaluations:
+                - type: pods
+                  properties:
+                    cluster: bar
+                    namespace: default
+                - type: pods
+                  properties:
+                    cluster: baz
+                    namespace: default
+                - type: secrets
+                  properties:
+                    cluster: bar
+                    namespace: kube-system
+      responses:
+        "200":
+          description: |
+            Batch evaluation results. Order matches the input `evaluations` slice.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EvaluationsResponse"
+              example:
+                evaluations:
+                  - decision: true
+                  - decision: false
+                  - decision: true
+        "400":
+          description: Bad request — subject.id is empty
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          description: Unauthenticated
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          description: Caller may not query this subject
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /access/v1/search/resource:
+    post:
+      summary: Resource scope search (forward query)
+      description: |
+        Answers: **in which (cluster, namespace) scopes can this subject perform
+        this action on this resource type?**
+
+        Returns the list of permission scopes where the subject has the requested
+        access. Clients intersect these scopes with their own resource index to
+        determine which specific resources are visible.
+
+        **ACM-specific interpretation of AuthZen Resource Search:**
+        The AuthZen spec envisions this endpoint returning individual resource
+        instances (with a resource `id` identifying a specific object). ACM's PDP
+        returns permission *scopes* (cluster + namespace pairs) instead, because:
+        - The PDP has authority over permissions, not resource inventory
+        - The resource inventory lives in the search index, not the PDP
+        - Returning scopes is O(1) regardless of fleet size; returning instances
+          would require the PDP to enumerate every resource across every cluster
+
+        Consumers (search, console) receive the scope list and apply it as a filter
+        on their own index: "show me all pods in bar/default, baz/alpha".
+
+        **Result ID format:** The synthetic `id` field is `"<cluster>/<namespace>"`.
+        `namespace: "*"` indicates cluster-wide access (coarse admin/view grants).
+
+        **AuthZen spec deviation:** Missing `resource.id` in the request (correctly
+        omitted — we're searching, not checking a specific instance). Missing
+        pagination (`page` / `page_size`). Returns scopes not instances.
+      operationId: searchResource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchResourceRequest"
+            examples:
+              search-pods:
+                summary: Where can alice GET pods?
+                value:
+                  subject:
+                    type: user
+                    id: alice
+                  action:
+                    name: get
+                  resource:
+                    type: pods
+              search-vms:
+                summary: Where can the sre-team GET VirtualMachines?
+                value:
+                  subject:
+                    type: group
+                    id: sre-team
+                  action:
+                    name: get
+                  resource:
+                    type: virtualmachines
+      responses:
+        "200":
+          description: |
+            List of (cluster, namespace) scopes where the subject has the requested
+            access. Empty `results` array means no access anywhere.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResourceResponse"
+              examples:
+                coarse-admin:
+                  summary: User has cluster-wide admin on two clusters
+                  value:
+                    results:
+                      - type: pods
+                        id: bar/*
+                        properties:
+                          cluster: bar
+                          namespace: "*"
+                      - type: pods
+                        id: baz/*
+                        properties:
+                          cluster: baz
+                          namespace: "*"
+                fine-grained:
+                  summary: User has namespace-scoped MCRA grants
+                  value:
+                    results:
+                      - type: virtualmachines
+                        id: bar/alpha
+                        properties:
+                          cluster: bar
+                          namespace: alpha
+                      - type: virtualmachines
+                        id: bar/beta
+                        properties:
+                          cluster: bar
+                          namespace: beta
+        "400":
+          description: Bad request — subject.id or resource.type is empty
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          description: Unauthenticated
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          description: Caller may not query this subject
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  schemas:
+
+    Subject:
+      type: object
+      required: [type, id]
+      description: |
+        Identifies who is making the access request.
+
+        **AuthZen spec deviation:** The spec allows an optional `properties` map
+        for extensibility. This is not supported.
+      properties:
+        type:
+          type: string
+          enum: [user, group]
+          description: |
+            `user` — matches by authenticated username (from TokenReview).
+            `group` — matches by group membership (caller must be a member).
+        id:
+          type: string
+          description: |
+            For `type: user` — the exact username (e.g. `alice`, `kube:admin`).
+            For `type: group` — the group name (e.g. `system:cluster-admins`).
+      example:
+        type: user
+        id: alice
+
+    Action:
+      type: object
+      required: [name]
+      description: |
+        The operation being requested, expressed as a Kubernetes verb.
+
+        **AuthZen spec deviation:** The spec allows an optional `properties` map.
+        This is not supported.
+      properties:
+        name:
+          type: string
+          description: |
+            A Kubernetes RBAC verb: `get`, `list`, `watch`, `create`, `update`,
+            `patch`, `delete`, `deletecollection`. Wildcard `*` is not accepted
+            as input — specify the exact verb you are checking.
+          enum:
+            - get
+            - list
+            - watch
+            - create
+            - update
+            - patch
+            - delete
+            - deletecollection
+      example:
+        name: get
+
+    Resource:
+      type: object
+      required: [type]
+      description: |
+        Describes the resource being accessed or searched for.
+      properties:
+        type:
+          type: string
+          description: |
+            The plural Kubernetes resource name. For core API group resources
+            use the bare plural (e.g. `pods`, `configmaps`, `secrets`). For
+            non-core resources, use the bare plural — the `apiGroup` property
+            disambiguates the group (e.g. `type: deployments` with
+            `properties.apiGroup: apps`).
+
+            For non-Kubernetes resources (metrics, observability data), use a
+            descriptive type string (e.g. `metric-series`). The PDP's resource
+            model is type-agnostic.
+        id:
+          type: string
+          description: |
+            Specific resource name. **Omit for search queries** — the PDP
+            evaluates permission scope, not a specific instance.
+        properties:
+          type: object
+          description: |
+            ACM-specific resource properties. Required for evaluation endpoints.
+            Optional (omit `id`) for search endpoints.
+          properties:
+            cluster:
+              type: string
+              description: |
+                Name of the managed cluster (as it appears in hub ManagedCluster
+                resources). **Required for `/evaluation` and `/evaluations`.**
+                For `/search/resource`, omit — results span all clusters.
+            namespace:
+              type: string
+              description: |
+                Target namespace on the managed cluster. Use empty string or omit
+                for cluster-scoped resources. **Required for `/evaluation` and
+                `/evaluations`.**
+            apiGroup:
+              type: string
+              description: |
+                Kubernetes API group. Use empty string `""` for core API group
+                resources (pods, configmaps, secrets, etc.). Use the group name
+                for non-core resources (e.g. `apps`, `batch`, `kubevirt.io`).
+          additionalProperties:
+            type: string
+      example:
+        type: pods
+        properties:
+          cluster: bar
+          namespace: default
+          apiGroup: ""
+
+    EvaluationRequest:
+      type: object
+      required: [subject, action, resource]
+      properties:
+        subject:
+          $ref: "#/components/schemas/Subject"
+        action:
+          $ref: "#/components/schemas/Action"
+        resource:
+          $ref: "#/components/schemas/Resource"
+          description: |
+            `resource.properties.cluster` is required.
+            `resource.properties.namespace` is required (use `""` for cluster-scoped).
+
+    EvaluationResponse:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: boolean
+          description: |
+            `true` — the subject is permitted to perform the action on the resource.
+            `false` — denied (no matching permission in the cache).
+
+            Note: `false` means no permission was found. It does not distinguish
+            between "no permission exists" and "permission was explicitly denied".
+            ACM's permission model is additive — there are no explicit deny rules.
+
+    EvaluationsRequest:
+      type: object
+      required: [subject, action, evaluations]
+      description: |
+        **ACM deviation from AuthZen spec:** A single `action` applies to all
+        items in `evaluations`. The spec defines per-item actions.
+      properties:
+        subject:
+          $ref: "#/components/schemas/Subject"
+        action:
+          $ref: "#/components/schemas/Action"
+          description: Applied to every resource in the `evaluations` list.
+        evaluations:
+          type: array
+          description: |
+            List of resources to evaluate. Results are returned in the same order.
+            Each item follows the `Resource` schema; `resource.properties.cluster`
+            is required for each item.
+          items:
+            $ref: "#/components/schemas/Resource"
+          minItems: 1
+
+    EvaluationsResponse:
+      type: object
+      required: [evaluations]
+      properties:
+        evaluations:
+          type: array
+          description: Results in the same order as the request `evaluations` list.
+          items:
+            $ref: "#/components/schemas/EvaluationResponse"
+
+    SearchResourceRequest:
+      type: object
+      required: [subject, action, resource]
+      description: |
+        `resource.id` must be omitted — this is a search, not a specific instance check.
+        `resource.properties` are also omitted (the search returns all matching scopes).
+      properties:
+        subject:
+          $ref: "#/components/schemas/Subject"
+        action:
+          $ref: "#/components/schemas/Action"
+        resource:
+          type: object
+          required: [type]
+          description: Only `type` is used. `id` and `properties` are ignored.
+          properties:
+            type:
+              type: string
+              description: Resource type to search for (e.g. `pods`, `virtualmachines`).
+
+    SearchResourceResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          description: |
+            List of (cluster, namespace) scopes where the subject has the requested
+            access. Empty array means no access anywhere.
+          items:
+            $ref: "#/components/schemas/SearchResult"
+
+    SearchResult:
+      type: object
+      required: [type, id, properties]
+      description: |
+        A single permission scope. The `id` is a synthetic `"<cluster>/<namespace>"`
+        identifier. Use `properties` for structured access.
+
+        **ACM-specific:** This represents a permission scope, not a resource instance.
+        `namespace: "*"` means cluster-wide access (from a coarse admin or view grant).
+      properties:
+        type:
+          type: string
+          description: Echoes the resource type from the request.
+        id:
+          type: string
+          description: |
+            Synthetic scope identifier in the format `"<cluster>/<namespace>"`.
+            For cluster-wide access: `"bar/*"`.
+            For namespace-scoped access: `"bar/alpha"`.
+        properties:
+          type: object
+          required: [cluster, namespace]
+          properties:
+            cluster:
+              type: string
+              description: Managed cluster name.
+            namespace:
+              type: string
+              description: |
+                Namespace on the managed cluster.
+                `"*"` indicates cluster-wide access.
+      example:
+        type: pods
+        id: bar/alpha
+        properties:
+          cluster: bar
+          namespace: alpha
+
+    AuthzenConfiguration:
+      type: object
+      description: |
+        Discovery document for implemented AuthZen endpoints.
+        Omits `access_search_subject_v1_endpoint` and `access_search_action_v1_endpoint`
+        because those endpoints are not yet implemented.
+      properties:
+        access_evaluation_v1_endpoint:
+          type: string
+          example: /access/v1/evaluation
+        access_evaluations_v1_endpoint:
+          type: string
+          example: /access/v1/evaluations
+        access_search_resource_v1_endpoint:
+          type: string
+          example: /access/v1/search/resource
+
+  securitySchemes:
+    BearerToken:
+      type: http
+      scheme: bearer
+      description: |
+        OpenShift/Kubernetes bearer token. Validated via TokenReview against the
+        hub kube-apiserver. Obtain via `oc whoami -t` or OpenShift OAuth password grant.
+
+security:
+  - BearerToken: []

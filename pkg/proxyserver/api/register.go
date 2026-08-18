@@ -6,6 +6,7 @@ import (
 
 	"github.com/stolostron/multicloud-operators-foundation/pkg/cache"
 	"github.com/stolostron/multicloud-operators-foundation/pkg/cache/userpermission"
+	"github.com/stolostron/multicloud-operators-foundation/pkg/proxyserver/authzen"
 	"github.com/stolostron/multicloud-operators-foundation/pkg/proxyserver/printers"
 	"github.com/stolostron/multicloud-operators-foundation/pkg/proxyserver/printers/storage"
 	"github.com/stolostron/multicloud-operators-foundation/pkg/proxyserver/rest/log"
@@ -16,6 +17,7 @@ import (
 	userpermissionrest "github.com/stolostron/multicloud-operators-foundation/pkg/proxyserver/rest/userpermission"
 	"github.com/stolostron/multicloud-operators-foundation/pkg/utils"
 	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
 	clusterclient "open-cluster-management.io/api/client/cluster/clientset/versioned"
 	clusterinformers "open-cluster-management.io/api/client/cluster/informers/externalversions"
 	cplisters "open-cluster-management.io/cluster-permission/client/listers/api/v1alpha1"
@@ -56,6 +58,7 @@ func init() {
 func Install(proxyServiceInfoGetter *getter.ProxyServiceInfoGetter,
 	logProxyGetter *getter.LogProxyGetter,
 	server *genericapiserver.GenericAPIServer,
+	kubeClient kubernetes.Interface,
 	client clusterclient.Interface,
 	informerFactory informers.SharedInformerFactory,
 	clusterInformer clusterinformers.SharedInformerFactory,
@@ -64,10 +67,12 @@ func Install(proxyServiceInfoGetter *getter.ProxyServiceInfoGetter,
 	if err := installProxyGroup(proxyServiceInfoGetter, logProxyGetter, server); err != nil {
 		return err
 	}
-	if err := installClusterViewGroup(server, client, informerFactory, clusterInformer,
-		clusterPermissionInformer, clusterPermissionLister); err != nil {
+	upCache, err := installClusterViewGroup(server, client, informerFactory, clusterInformer,
+		clusterPermissionInformer, clusterPermissionLister)
+	if err != nil {
 		return err
 	}
+	installAuthZen(server, upCache, kubeClient)
 	return nil
 }
 
@@ -77,7 +82,7 @@ func installClusterViewGroup(server *genericapiserver.GenericAPIServer,
 	clusterInformer clusterinformers.SharedInformerFactory,
 	clusterPermissionInformer kubecache.SharedIndexInformer,
 	clusterPermissionLister cplisters.ClusterPermissionLister,
-) error {
+) (*userpermission.Cache, error) {
 
 	clusterCache := cache.NewClusterCache(
 		clusterInformer.Cluster().V1().ManagedClusters(),
@@ -134,7 +139,18 @@ func installClusterViewGroup(server *genericapiserver.GenericAPIServer,
 	go clusterCache.Run(1 * time.Second)
 	go clusterSetCache.Run(1 * time.Second)
 	go userPermissionCache.Run(2 * time.Second)
-	return server.InstallAPIGroup(&apiGroupInfo)
+	if err := server.InstallAPIGroup(&apiGroupInfo); err != nil {
+		return nil, err
+	}
+	return userPermissionCache, nil
+}
+
+func installAuthZen(server *genericapiserver.GenericAPIServer, lister userpermission.Lister, kubeClient kubernetes.Interface) {
+	h := authzen.NewHandler(authzen.NewUserPermissionDecider(lister), kubeClient)
+	server.Handler.NonGoRestfulMux.HandleFunc("/.well-known/authzen-configuration", h.Discovery)
+	server.Handler.NonGoRestfulMux.HandleFunc("/access/v1/evaluation", h.Evaluation)
+	server.Handler.NonGoRestfulMux.HandleFunc("/access/v1/evaluations", h.Evaluations)
+	server.Handler.NonGoRestfulMux.HandleFunc("/access/v1/search/resource", h.SearchResource)
 }
 
 func installProxyGroup(proxyServiceInfoGetter *getter.ProxyServiceInfoGetter,
