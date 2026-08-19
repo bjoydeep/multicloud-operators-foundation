@@ -102,14 +102,15 @@ func permAllows(perm *clusterviewv1alpha1.UserPermission, cluster, namespace, re
 }
 
 // bindingCovers returns true if any binding matches the cluster and namespace.
-// namespace="" is treated as matching any namespace (useful for cluster-scoped resources).
+// Callers must pass "*" explicitly for cluster-scoped intent — empty string is not
+// treated as a wildcard to prevent false allows when namespace is omitted from the request.
 func bindingCovers(bindings []clusterviewv1alpha1.ClusterBinding, cluster, namespace string) bool {
 	for _, b := range bindings {
 		if b.Cluster != cluster {
 			continue
 		}
 		for _, ns := range b.Namespaces {
-			if ns == "*" || ns == namespace || namespace == "" {
+			if ns == "*" || ns == namespace {
 				return true
 			}
 		}

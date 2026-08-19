@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	authorizationv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,15 +28,18 @@ func NewHandler(decider Decider, kubeClient kubernetes.Interface) *Handler {
 }
 
 // Discovery serves GET /.well-known/authzen-configuration.
+// Returns absolute HTTPS URLs per the AuthZen Authorization API 1.0 spec.
 func (h *Handler) Discovery(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	base := "https://" + r.Host
 	writeJSON(w, map[string]string{
-		"access_evaluation_v1_endpoint":        "/access/v1/evaluation",
-		"access_evaluations_v1_endpoint":       "/access/v1/evaluations",
-		"access_search_resource_v1_endpoint":   "/access/v1/search/resource",
+		"policy_decision_point":        base,
+		"access_evaluation_endpoint":   base + "/access/v1/evaluation",
+		"access_evaluations_endpoint":  base + "/access/v1/evaluations",
+		"search_resource_endpoint":     base + "/access/v1/search/resource",
 	})
 }
 
@@ -99,14 +103,26 @@ func (h *Handler) Evaluations(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden: caller may only query their own permissions", http.StatusForbidden)
 		return
 	}
+	semantic := SemanticExecuteAll
+	if req.Options != nil && req.Options.EvaluationsSemantic != "" {
+		semantic = req.Options.EvaluationsSemantic
+	}
+
 	decisions, err := h.decider.EvaluateBatch(r.Context(), subjectUserInfo(req.Subject, callerInfo), req.Action, req.Evaluations)
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return
 	}
-	resp := EvaluationsResponse{Evaluations: make([]EvaluationResponse, len(decisions))}
-	for i, d := range decisions {
-		resp.Evaluations[i] = EvaluationResponse{Decision: d}
+
+	resp := EvaluationsResponse{Evaluations: make([]EvaluationResponse, 0, len(decisions))}
+	for _, d := range decisions {
+		resp.Evaluations = append(resp.Evaluations, EvaluationResponse{Decision: d})
+		if semantic == SemanticDenyOnFirstDeny && !d {
+			break // logical AND: stop on first false
+		}
+		if semantic == SemanticPermitOnFirstPermit && d {
+			break // logical OR: stop on first true
+		}
 	}
 	writeJSON(w, resp)
 }
@@ -187,7 +203,7 @@ func (h *Handler) callerCanQuerySubject(ctx context.Context, caller user.Info, s
 	if subject.Type == "group" {
 		resource = "groups"
 	}
-	klog.Infof("[authzen] impersonation SAR: caller=%q checking impersonate %s/%s", caller.GetName(), resource, subject.ID)
+	klog.V(4).Infof("[authzen] impersonation SAR: caller=%q checking impersonate %s/%s", caller.GetName(), resource, subject.ID)
 	sar, err := h.kubeClient.AuthorizationV1().SubjectAccessReviews().Create(
 		ctx,
 		&authorizationv1.SubjectAccessReview{
@@ -207,20 +223,21 @@ func (h *Handler) callerCanQuerySubject(ctx context.Context, caller user.Info, s
 		klog.Errorf("[authzen] impersonation SAR error: %v", err)
 		return false
 	}
-	klog.Infof("[authzen] impersonation SAR result: allowed=%v reason=%q", sar.Status.Allowed, sar.Status.Reason)
+	klog.V(4).Infof("[authzen] impersonation SAR result: allowed=%v reason=%q", sar.Status.Allowed, sar.Status.Reason)
 	return sar.Status.Allowed
 }
 
 // subjectUserInfo returns the user.Info to use for cache lookups.
 //
 // Three cases:
-//   - group subject: scoped user.Info with only that group, so the cache returns
-//     only that group's permissions (not the caller's other groups).
+//   - group subject: scoped user.Info with only that group.
 //   - user subject, self-query (caller IS the subject): use the caller's full user.Info
-//     (name + groups), so group-based permissions are correctly resolved.
-//   - user subject, impersonation (caller != subject): use a minimal user.Info with only
-//     the subject's name. Group membership for the subject is unavailable without an
-//     identity provider lookup; only direct user-level bindings will be resolved.
+//     (name + groups) so group-based permissions are correctly resolved.
+//   - user subject, impersonation (caller != subject): use the subject's name plus any
+//     groups supplied in subject.Properties["groups"] (comma-separated). Elevated callers
+//     (Search, MCP server) obtain group membership via a single TokenReview and pass it
+//     here so the PDP resolves group-inherited permissions correctly. Without groups, only
+//     direct user-level bindings are resolved.
 func subjectUserInfo(subject Subject, caller user.Info) user.Info {
 	if subject.Type == "group" {
 		return &user.DefaultInfo{Groups: []string{subject.ID}}
@@ -228,7 +245,26 @@ func subjectUserInfo(subject Subject, caller user.Info) user.Info {
 	if caller.GetName() == subject.ID {
 		return caller // self-query: full user.Info including groups
 	}
-	return &user.DefaultInfo{Name: subject.ID} // impersonation: name only
+	// impersonation path: build user.Info from subject.id + optional groups
+	groups := parseGroups(subject.Properties["groups"])
+	return &user.DefaultInfo{Name: subject.ID, Groups: groups}
+}
+
+// parseGroups splits a comma-separated group string into a slice.
+// Returns nil (not an empty slice) when the input is empty so callers can
+// distinguish "no groups provided" from "empty groups list".
+func parseGroups(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	groups := make([]string, 0, len(parts))
+	for _, g := range parts {
+		if g = strings.TrimSpace(g); g != "" {
+			groups = append(groups, g)
+		}
+	}
+	return groups
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

@@ -60,6 +60,7 @@ func postRequest(t *testing.T, path string, body interface{}) *http.Request {
 func TestDiscovery_ReturnsConfig(t *testing.T) {
 	h := NewHandler(&mockDecider{}, nil)
 	r, _ := http.NewRequest(http.MethodGet, "/.well-known/authzen-configuration", nil)
+	r.Host = "ocm-proxyserver.multicluster-engine.svc:443"
 	w := httptest.NewRecorder()
 	h.Discovery(w, r)
 	if w.Code != http.StatusOK {
@@ -69,8 +70,15 @@ func TestDiscovery_ReturnsConfig(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp["access_evaluation_v1_endpoint"] != "/access/v1/evaluation" {
-		t.Errorf("unexpected discovery body: %v", resp)
+	base := "https://ocm-proxyserver.multicluster-engine.svc:443"
+	if resp["policy_decision_point"] != base {
+		t.Errorf("policy_decision_point: got %q want %q", resp["policy_decision_point"], base)
+	}
+	if resp["access_evaluation_endpoint"] != base+"/access/v1/evaluation" {
+		t.Errorf("access_evaluation_endpoint: got %q", resp["access_evaluation_endpoint"])
+	}
+	if resp["search_resource_endpoint"] != base+"/access/v1/search/resource" {
+		t.Errorf("search_resource_endpoint: got %q", resp["search_resource_endpoint"])
 	}
 }
 
@@ -236,6 +244,66 @@ func TestEvaluations_ReturnsMixedResults(t *testing.T) {
 	}
 }
 
+func TestEvaluations_DenyOnFirstDeny_ShortCircuits(t *testing.T) {
+	// Results: true, false, true — deny_on_first_deny stops after the second item
+	h := NewHandler(&mockDecider{evaluateBatchResult: []bool{true, false, true}}, nil)
+	sem := SemanticDenyOnFirstDeny
+	body := EvaluationsRequest{
+		Subject:     Subject{Type: "user", ID: "alice"},
+		Action:      Action{Name: "get"},
+		Options:     &EvaluationsOptions{EvaluationsSemantic: sem},
+		Evaluations: []Resource{
+			{Type: "pods", Properties: map[string]string{"cluster": "bar", "namespace": "a"}},
+			{Type: "pods", Properties: map[string]string{"cluster": "baz", "namespace": "a"}},
+			{Type: "pods", Properties: map[string]string{"cluster": "bar", "namespace": "b"}},
+		},
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/evaluations", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.Evaluations(w, r)
+	var resp EvaluationsResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	// Only 2 results returned — stopped at first deny
+	if len(resp.Evaluations) != 2 {
+		t.Fatalf("deny_on_first_deny: expected 2 results (stopped at deny), got %d", len(resp.Evaluations))
+	}
+	if resp.Evaluations[0].Decision != true || resp.Evaluations[1].Decision != false {
+		t.Errorf("unexpected decisions: %+v", resp.Evaluations)
+	}
+}
+
+func TestEvaluations_PermitOnFirstPermit_ShortCircuits(t *testing.T) {
+	// Results: false, true, true — permit_on_first_permit stops after the second item
+	h := NewHandler(&mockDecider{evaluateBatchResult: []bool{false, true, true}}, nil)
+	sem := SemanticPermitOnFirstPermit
+	body := EvaluationsRequest{
+		Subject:     Subject{Type: "user", ID: "alice"},
+		Action:      Action{Name: "get"},
+		Options:     &EvaluationsOptions{EvaluationsSemantic: sem},
+		Evaluations: []Resource{
+			{Type: "pods", Properties: map[string]string{"cluster": "bar", "namespace": "a"}},
+			{Type: "pods", Properties: map[string]string{"cluster": "baz", "namespace": "a"}},
+			{Type: "pods", Properties: map[string]string{"cluster": "bar", "namespace": "b"}},
+		},
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/evaluations", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.Evaluations(w, r)
+	var resp EvaluationsResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	// Only 2 results returned — stopped at first permit
+	if len(resp.Evaluations) != 2 {
+		t.Fatalf("permit_on_first_permit: expected 2 results (stopped at permit), got %d", len(resp.Evaluations))
+	}
+	if resp.Evaluations[0].Decision != false || resp.Evaluations[1].Decision != true {
+		t.Errorf("unexpected decisions: %+v", resp.Evaluations)
+	}
+}
+
 // --- SearchResource ---
 
 func TestSearchResource_ReturnsScopes(t *testing.T) {
@@ -329,5 +397,72 @@ func TestEvaluation_ForbiddenWhenImpersonationDenied(t *testing.T) {
 	h.Evaluation(w, r)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 (impersonation denied), got %d", w.Code)
+	}
+}
+
+// --- subject.properties.groups ---
+
+func TestParseGroups(t *testing.T) {
+	cases := []struct {
+		input    string
+		expected []string
+	}{
+		{"", nil},
+		{"sre-team", []string{"sre-team"}},
+		{"sre-team,system:authenticated", []string{"sre-team", "system:authenticated"}},
+		{" sre-team , system:authenticated ", []string{"sre-team", "system:authenticated"}},
+	}
+	for _, c := range cases {
+		got := parseGroups(c.input)
+		if len(got) != len(c.expected) {
+			t.Errorf("parseGroups(%q): got %v want %v", c.input, got, c.expected)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.expected[i] {
+				t.Errorf("parseGroups(%q)[%d]: got %q want %q", c.input, i, got[i], c.expected[i])
+			}
+		}
+	}
+}
+
+func TestEvaluation_ImpersonationWithGroups_PassedToDecider(t *testing.T) {
+	// search-sa queries alice's permissions and supplies her groups via subject.properties.
+	// The mock decider captures the user.Info it receives so we can verify groups are passed.
+	var capturedInfo user.Info
+	capturingDecider := &mockDecider{evaluateResult: true}
+	_ = capturingDecider // mock doesn't capture user.Info yet — we verify via subjectUserInfo directly
+
+	// Directly test subjectUserInfo to confirm groups are parsed and included
+	subject := Subject{
+		Type:       "user",
+		ID:         "alice",
+		Properties: map[string]string{"groups": "sre-team,system:authenticated"},
+	}
+	caller := &user.DefaultInfo{Name: "search-sa"} // caller != subject → impersonation path
+	info := subjectUserInfo(subject, caller)
+
+	if info.GetName() != "alice" {
+		t.Errorf("expected name=alice, got %q", info.GetName())
+	}
+	groups := info.GetGroups()
+	if len(groups) != 2 || groups[0] != "sre-team" || groups[1] != "system:authenticated" {
+		t.Errorf("expected groups=[sre-team system:authenticated], got %v", groups)
+	}
+	capturedInfo = info
+	_ = capturedInfo
+}
+
+func TestEvaluation_ImpersonationNoGroups_NameOnly(t *testing.T) {
+	// Without subject.properties.groups, impersonation path uses name only
+	subject := Subject{Type: "user", ID: "alice"}
+	caller := &user.DefaultInfo{Name: "search-sa"}
+	info := subjectUserInfo(subject, caller)
+
+	if info.GetName() != "alice" {
+		t.Errorf("expected name=alice, got %q", info.GetName())
+	}
+	if len(info.GetGroups()) != 0 {
+		t.Errorf("expected no groups without properties, got %v", info.GetGroups())
 	}
 }

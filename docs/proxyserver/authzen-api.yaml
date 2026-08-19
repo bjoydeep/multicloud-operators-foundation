@@ -64,12 +64,13 @@ info:
       verbs: ["impersonate"]
     ```
 
-    **Important — group membership for cross-subject queries:**
-    When an elevated caller queries a user subject (Path 2), the PDP resolves the
-    target user's permissions using only their username — not their group memberships,
-    which are unavailable without an identity provider lookup. Group-inherited permissions
-    will not appear in the result. To query a group's permissions specifically, use
-    `subject.type: group` with the group name.
+    **Group membership for cross-subject queries:**
+    When querying on behalf of another user (Path 2), pass the target user's group
+    memberships in `subject.properties.groups` (comma-separated). Without this field,
+    only direct user-level bindings are resolved and group-inherited permissions are
+    missed. Callers obtain group membership via a single `TokenReview` against the hub
+    kube-apiserver using the target user's bearer token — no IDP integration required.
+    See `subject.properties` in the schema for the exact format.
 
     Requests that satisfy neither path return `403 Forbidden`.
 
@@ -88,13 +89,12 @@ paths:
     get:
       summary: AuthZen discovery
       description: |
-        Returns the URLs of the AuthZen endpoints implemented by this server.
-        Follows the AuthZen `/.well-known/authzen-configuration` discovery convention.
+        Returns the absolute URLs of the AuthZen endpoints implemented by this server.
+        Follows the AuthZen Authorization API 1.0 `/.well-known/authzen-configuration`
+        discovery convention with spec-compliant field names and absolute HTTPS URLs.
 
-        **AuthZen spec deviation:** The AuthZen spec defines additional discovery
-        fields (e.g. `access_search_subject_v1_endpoint`,
-        `access_search_action_v1_endpoint`). These are omitted because the
-        corresponding endpoints are not yet implemented.
+        `search_subject_endpoint` and `search_action_endpoint` are omitted because
+        those endpoints are not yet implemented.
       operationId: getAuthzenConfiguration
       responses:
         "200":
@@ -104,9 +104,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/AuthzenConfiguration"
               example:
-                access_evaluation_v1_endpoint: /access/v1/evaluation
-                access_evaluations_v1_endpoint: /access/v1/evaluations
-                access_search_resource_v1_endpoint: /access/v1/search/resource
+                policy_decision_point: "https://ocm-proxyserver.multicluster-engine.svc:443"
+                access_evaluation_endpoint: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/evaluation"
+                access_evaluations_endpoint: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/evaluations"
+                search_resource_endpoint: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/search/resource"
 
   /access/v1/evaluation:
     post:
@@ -416,9 +417,6 @@ components:
       required: [type, id]
       description: |
         Identifies who is making the access request.
-
-        **AuthZen spec deviation:** The spec allows an optional `properties` map
-        for extensibility. This is not supported.
       properties:
         type:
           type: string
@@ -431,6 +429,25 @@ components:
           description: |
             For `type: user` — the exact username (e.g. `alice`, `kube:admin`).
             For `type: group` — the group name (e.g. `system:cluster-admins`).
+        properties:
+          type: object
+          description: |
+            Optional subject attributes. ACM-defined extension for cross-subject queries.
+
+            **`groups`** (string, comma-separated): the target user's group memberships.
+            Used by elevated callers (Search, MCP server) when querying on behalf of
+            another user via the impersonation path. Without this, only direct
+            user-level bindings are resolved — group-inherited permissions are missed.
+
+            Callers obtain group membership by doing a `TokenReview` against the hub
+            kube-apiserver using the target user's bearer token. This is a
+            spec-compliant use of AuthZen's `subject.properties` extensibility.
+
+            ```json
+            "properties": { "groups": "sre-team,system:authenticated" }
+            ```
+          additionalProperties:
+            type: string
       example:
         type: user
         id: alice
@@ -546,6 +563,26 @@ components:
             between "no permission exists" and "permission was explicitly denied".
             ACM's permission model is additive — there are no explicit deny rules.
 
+    EvaluationsSemantic:
+      type: string
+      enum: [execute_all, deny_on_first_deny, permit_on_first_permit]
+      default: execute_all
+      description: |
+        Controls short-circuit behaviour in batch evaluation.
+        - `execute_all` (default): evaluate all items, return all results.
+        - `deny_on_first_deny`: stop at the first `false` decision (logical AND —
+          "does the subject have ALL of these permissions?").
+        - `permit_on_first_permit`: stop at the first `true` decision (logical OR —
+          "does the subject have ANY of these permissions?").
+        When short-circuiting, the response contains only the items evaluated before
+        the condition was met.
+
+    EvaluationsOptions:
+      type: object
+      properties:
+        evaluations_semantic:
+          $ref: "#/components/schemas/EvaluationsSemantic"
+
     EvaluationsRequest:
       type: object
       required: [subject, action, evaluations]
@@ -561,12 +598,15 @@ components:
         evaluations:
           type: array
           description: |
-            List of resources to evaluate. Results are returned in the same order.
+            List of resources to evaluate. Results are returned in the same order
+            (or truncated if a short-circuit semantic is used).
             Each item follows the `Resource` schema; `resource.properties.cluster`
             is required for each item.
           items:
             $ref: "#/components/schemas/Resource"
           minItems: 1
+        options:
+          $ref: "#/components/schemas/EvaluationsOptions"
 
     EvaluationsResponse:
       type: object
@@ -652,18 +692,27 @@ components:
       type: object
       description: |
         Discovery document for implemented AuthZen endpoints.
-        Omits `access_search_subject_v1_endpoint` and `access_search_action_v1_endpoint`
-        because those endpoints are not yet implemented.
+        Follows the AuthZen Authorization API 1.0 spec with absolute HTTPS URLs.
+        `search_subject_endpoint` and `search_action_endpoint` are omitted because
+        those endpoints are not yet implemented.
+      required: [policy_decision_point, access_evaluation_endpoint]
       properties:
-        access_evaluation_v1_endpoint:
+        policy_decision_point:
           type: string
-          example: /access/v1/evaluation
-        access_evaluations_v1_endpoint:
+          description: Absolute HTTPS URL identifying this PDP.
+          example: "https://ocm-proxyserver.multicluster-engine.svc:443"
+        access_evaluation_endpoint:
           type: string
-          example: /access/v1/evaluations
-        access_search_resource_v1_endpoint:
+          description: Absolute URL of the single evaluation endpoint.
+          example: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/evaluation"
+        access_evaluations_endpoint:
           type: string
-          example: /access/v1/search/resource
+          description: Absolute URL of the batch evaluation endpoint.
+          example: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/evaluations"
+        search_resource_endpoint:
+          type: string
+          description: Absolute URL of the resource scope search endpoint.
+          example: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/search/resource"
 
   securitySchemes:
     BearerToken:

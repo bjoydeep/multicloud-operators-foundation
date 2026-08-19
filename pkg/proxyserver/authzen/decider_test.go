@@ -156,6 +156,41 @@ func TestEvaluate_NamespaceScopedBinding_OutOfScopeDenied(t *testing.T) {
 	}
 }
 
+// TestEvaluate_EmptyNamespaceIsDenied verifies that omitting namespace from the request
+// does NOT produce a false allow — callers must pass "*" explicitly for cluster-scoped intent.
+func TestEvaluate_EmptyNamespaceIsDenied(t *testing.T) {
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"kubevirt.io"}, Resources: []string{"virtualmachines"}, Verbs: []string{"get"}},
+	}
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{namespacedPermission("bar", []string{"alpha"}, rules)},
+	}})
+
+	// empty namespace must NOT match namespace-scoped binding for "alpha"
+	got, err := d.Evaluate(ctx, alice, Action{Name: "get"},
+		Resource{Type: "virtualmachines", Properties: map[string]string{"cluster": "bar", "namespace": "", "apiGroup": "kubevirt.io"}},
+	)
+	if err != nil || got {
+		t.Errorf("empty namespace should be denied, not treated as wildcard; got %v err %v", got, err)
+	}
+
+	// "*" namespace must NOT match namespace-scoped binding either (user has no cluster-wide grant)
+	got, err = d.Evaluate(ctx, alice, Action{Name: "get"},
+		Resource{Type: "virtualmachines", Properties: map[string]string{"cluster": "bar", "namespace": "*", "apiGroup": "kubevirt.io"}},
+	)
+	if err != nil || got {
+		t.Errorf("wildcard namespace request should not match a namespace-scoped binding; got %v err %v", got, err)
+	}
+
+	// explicit in-scope namespace must still work
+	got, err = d.Evaluate(ctx, alice, Action{Name: "get"},
+		Resource{Type: "virtualmachines", Properties: map[string]string{"cluster": "bar", "namespace": "alpha", "apiGroup": "kubevirt.io"}},
+	)
+	if err != nil || !got {
+		t.Errorf("explicit in-scope namespace should be allowed; got %v err %v", got, err)
+	}
+}
+
 func TestEvaluate_NoPermissions_Denied(t *testing.T) {
 	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{}})
 	got, err := d.Evaluate(ctx, alice, Action{Name: "get"},

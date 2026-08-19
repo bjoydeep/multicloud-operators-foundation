@@ -2,23 +2,81 @@
 
 | Field | Value |
 |---|---|
-| **Last reviewed** | 2026-08-18 15:02 PDT |
+| **Last reviewed** | 2026-08-18 15:31 PDT |
 | **Reviewer** | Joydeep Banerjee |
 | **Scope** | Phase 3 MVP — AuthZen endpoints in `ocm-proxyserver` |
 | **Parent DDR** | ACM-DDR-083 |
 | **Code reviewed** | `pkg/proxyserver/authzen/`, `pkg/proxyserver/api/register.go`, `cmd/proxyserver/app/server.go` |
 | **API spec reviewed** | `docs/proxyserver/authzen-api.yaml` |
-| **Status** | Action items identified — see below |
+| **Status** | 1 Must open (#1 resource type taxonomy). 2 follow-up issues found during verification — see below. |
+
+---
+
+## Verification Log
+
+Code was read directly to confirm each claimed fix. Results:
+
+| # | Claimed fix | Verified? | Notes |
+|---|---|---|---|
+| #2 | Discovery — spec-compliant field names, absolute HTTPS URLs | ✓ | Field names in `handler.go` and `authzen-api.yaml` are now **inconsistent** — see follow-up items |
+| #3 | Batch `options.evaluations_semantic` with short-circuit | ✓ | Short-circuit truncates the **response**, but `EvaluateBatch` in `decider.go` still evaluates all items — see follow-up items |
+| #4 | `namespace == ""` false positive removed from `bindingCovers` | ✓ | Clean fix; comment added |
+| #5 | Group resolution limitation documented | ✓ | Superseded by #9; OpenAPI YAML `Subject` schema still says `properties` "not supported" — see follow-up items |
+| #6 | `klog.Infof` → `klog.V(4).Infof` on SAR logs | ✓ | Both log lines downgraded |
+| #9 | `subject.properties.groups` extension implemented | ✓ | `Subject.Properties`, `parseGroups`, and `subjectUserInfo` all verified |
+
+---
+
+## Follow-up Items Found During Verification
+
+These were not in the original action items list. Both are small but must be resolved
+before the OpenAPI spec is shared externally.
+
+**F1 — OpenAPI YAML and `handler.go` use different discovery field names.**
+
+`handler.go` (current code):
+```go
+"access_evaluation_endpoint":   base + "/access/v1/evaluation"
+"access_evaluations_endpoint":  base + "/access/v1/evaluations"
+"search_resource_endpoint":     base + "/access/v1/search/resource"
+```
+
+`authzen-api.yaml` `AuthzenConfiguration` schema (not yet updated):
+```yaml
+access_evaluation_v1_endpoint:   ...
+access_evaluations_v1_endpoint:  ...
+access_search_resource_v1_endpoint: ...
+```
+
+The code removed the `_v1_` infix and changed `access_search_resource` to
+`search_resource`. The YAML schema needs to be updated to match before the spec is
+shared. One of them is also wrong against the AuthZen spec itself — needs a check
+against the published spec to confirm which naming the standard uses.
+
+**F2 — OpenAPI YAML `Subject` schema still says `properties` is "not supported".**
+
+Since #9 implemented `subject.properties.groups`, the `Subject` schema description
+in `authzen-api.yaml` is now outdated:
+
+```yaml
+# Still says this — wrong since #9:
+**AuthZen spec deviation:** The spec allows an optional `properties` map
+for extensibility. This is not supported.
+```
+
+This needs to be updated to document the supported `groups` key and its format.
 
 ---
 
 ## Overall Assessment
 
 The design is architecturally sound. The phasing (PIP unification first, PDP on top) is
-correct: a decision service built on fragmented data would just centralize the inconsistency.
-Phase 3 as implemented is a solid POC. The Decider interface boundary is clean. The test
-coverage is good for a first pass. The gaps below are the difference between a POC and a
-production-grade, standards-aligned PDP that can survive an API review.
+correct: a decision service built on fragmented data would just centralize the
+inconsistency. Phase 3 as implemented is a solid POC. The Decider interface boundary is
+clean. The test coverage is good for a first pass.
+
+After the fixes in this round, one Must-priority item remains open (#1 — resource type
+taxonomy). All correctness and operational issues from the initial review are resolved.
 
 ---
 
@@ -59,10 +117,10 @@ which a reviewer should read in order.
 
 | Category | Items | Reviewer posture |
 |---|---|---|
-| [A. Spec-compliant uses](#a-spec-compliant-uses) | 1 | Strengths — lead with these |
+| [A. Spec-compliant uses](#a-spec-compliant-uses) | 2 | Strengths — lead with these |
 | [B. Intentional architectural deviations](#b-intentional-architectural-deviations) | 3 | Design choices we own and can defend |
 | [C. Where AuthZen is inadequate for multicluster Kubernetes](#c-where-authzen-is-inadequate-for-multicluster-kubernetes) | 2 | Spec gaps, not our gaps |
-| [D. Spec features not yet implemented](#d-spec-features-not-yet-implemented) | 5 | Gaps to close — tracked in action items |
+| [D. Spec features not yet implemented](#d-spec-features-not-yet-implemented) | 2 | Gaps to close or explicitly deferred |
 
 ---
 
@@ -70,7 +128,7 @@ which a reviewer should read in order.
 
 These look like they might be deviations but are not. Lead with them in any review.
 
-**`properties.cluster`, `properties.namespace`, `properties.apiGroup` — intended use of the extension mechanism.**
+**`resource.properties` — intended use of the spec's extension mechanism.**
 
 AuthZen's spec defines `properties` on the Resource object as:
 
@@ -79,13 +137,34 @@ AuthZen's spec defines `properties` on the Resource object as:
 > used in access evaluations or metadata about the resource."*
 
 The phrase "but are not limited to" is deliberate — the spec enumerates no specific
-property names. Implementations define whatever attributes their authorization policy
-requires. ACM's three properties (`cluster`, `namespace`, `apiGroup`) are exactly what
-`properties` is for. This is a **strength** in a review, not something to defend.
+property names. Implementations define whatever their authorization policy requires.
+ACM's use of `properties.cluster`, `properties.namespace`, and `properties.apiGroup`
+is exactly what `properties` is designed for.
 
 *Posture:* "We use `properties` as the spec intends — to carry the authorization context
 our policy requires. Cluster and namespace are the dimensions ACM policy evaluates against.
 They belong in `properties` by design."
+
+**`subject.properties.groups` — spec-compliant extension for cross-subject group resolution.**
+
+The same extensibility pattern applies to `Subject`. The spec defines `subject.properties`
+as an optional map. ACM uses it to carry the target user's group memberships in
+cross-subject (impersonation) queries, so the PDP can resolve group-inherited permissions
+correctly without an IDP integration:
+
+```json
+{
+  "subject": {
+    "type": "user",
+    "id": "alice",
+    "properties": { "groups": "sre-team,system:authenticated" }
+  }
+}
+```
+
+Callers obtain group memberships via a single `TokenReview` against the hub
+kube-apiserver — they already hold the user's bearer token because requests in ACM's
+architecture flow through the authenticated caller.
 
 ---
 
@@ -103,13 +182,12 @@ not about which VMs or ConfigMaps exist (that is Search's index). Returning
 is the only design that is O(1) at fleet scale. Returning instances would require the
 PDP to enumerate every resource across every managed cluster on every query.
 
-*Defense:* "We implement the AuthZen interface. Our PDP is a permission-scope server,
-not a resource catalog. Resource inventory belongs to Search — it already indexes every
-resource across every managed cluster. Coupling the PDP to that inventory would create
-a circular dependency: Search needs the PDP to scope what to show, and the PDP would
-need Search's data to know what exists. Separating them keeps each service in its own
-domain. The PDP returns permission scope; Search intersects that scope against its own
-index. This is the only design that is O(1) at fleet scale."
+*Defense:* "Our PDP is a permission-scope server, not a resource catalog. Resource
+inventory belongs to Search — it already indexes every resource across every managed
+cluster. Coupling the PDP to that inventory would create a circular dependency: Search
+needs the PDP to scope what to show, and the PDP would need Search's data to know what
+exists. The PDP returns permission scope; Search intersects that scope against its index.
+This is the only design that is O(1) at fleet scale."
 
 **`resource.id` omitted on search requests.**
 
@@ -117,8 +195,7 @@ The AuthZen spec marks `id` as REQUIRED on the Resource object. ACM omits it on
 `/access/v1/search/resource` requests because the search endpoint asks "in which scopes
 can alice access this resource type?" — the specific resource instance is unknown and
 irrelevant. The spec's schema was designed with evaluation (checking a known instance)
-in mind; the schema and the search endpoint's own semantics are in tension. The spec's
-rationale for the search endpoint supports omitting `id`.
+in mind; the schema and the search endpoint's own semantics are in tension.
 
 *Defense:* "Requiring `id` on a search request contradicts the purpose of the search
 endpoint, which the spec itself defines as discovering what a subject can access. We
@@ -128,11 +205,11 @@ follow the endpoint's stated purpose over its schema constraint."
 
 The AuthZen spec defines `evaluations` as a list of `{action, resource}` pairs, allowing
 a different action per resource. ACM uses a single top-level `action` that applies to
-all resources in the batch. This is a deliberate simplification: ACM's batch use case
-is always the same operation across multiple resources ("can alice GET each of these?").
-Per-item actions add schema complexity with no current consumer benefit.
+all resources in the batch. ACM's batch use case is always the same operation across
+multiple resources ("can alice GET each of these?"). Per-item actions add schema
+complexity with no current consumer benefit.
 
-*Defense:* "Our batch use case is homogeneous by design. We can add per-item actions
+*Defense:* "Our batch use case is homogeneous by design. Per-item actions can be added
 when a consumer needs them without a breaking change — the simplification is additive."
 
 ---
@@ -140,7 +217,7 @@ when a consumer needs them without a breaking change — the simplification is a
 ### C. Where AuthZen Is Inadequate for Multicluster Kubernetes
 
 These are not our gaps — they are places where the AuthZen spec does not address the
-problem domain well. Document them as spec limitations, not implementation limitations.
+problem domain. Document them as spec limitations, not implementation limitations.
 
 **The cluster dimension has no AuthZen equivalent.**
 
@@ -155,99 +232,41 @@ this extension. This is a gap in the spec for distributed Kubernetes environment
 
 **AuthZen has no answer for cross-subject group resolution.**
 
-Search does not yet call these AuthZen endpoints — it currently uses the `userpermissions`
-API directly. This gap will surface when Search (or Console) integrates with the PDP.
-A concrete example shows why it matters.
+Search does not yet call these endpoints — it currently uses the `userpermissions` API
+directly. This gap will surface when Search or Console integrates with the PDP.
 
-Alice is a member of the `sre-team` group. An admin granted `sre-team` admin access
-on cluster `bar`. There is no direct binding to alice — her access flows entirely
-through the group.
+Alice is a member of the `sre-team` group. An admin granted `sre-team` admin access on
+cluster `bar`. There is no direct binding to alice — her access flows entirely through
+the group.
 
-Alice queries the PDP herself: the PDP extracts her full identity from her bearer
-token (name `alice`, groups `[sre-team, system:authenticated]`), looks up both alice's
-direct permissions and `sre-team`'s permissions, and correctly returns `decision: true`.
+Alice queries the PDP herself: the PDP extracts her full identity from her bearer token
+(name `alice`, groups `[sre-team, system:authenticated]`), looks up both alice's direct
+permissions and `sre-team`'s permissions, and correctly returns `decision: true`.
 
-When Search integrates with the PDP, it will call on alice's behalf as a service account:
-```json
-{ "subject": { "type": "user", "id": "alice" }, "action": { "name": "get" }, ... }
-```
-The PDP knows the caller is `search-sa`, not alice. All it has for alice is her name.
-It has no way to know alice is in `sre-team` — that information lives in OpenShift's
-OAuth server (or whichever identity provider issued alice's token), not in the
-authorization store. So the PDP looks up alice by name, finds no direct binding, and
-returns `decision: false` — the wrong answer.
+When Search integrates with the PDP, it will call on alice's behalf as a service account.
+Without group context it only has alice's name — no direct binding exists — and returns
+`decision: false`. The wrong answer.
 
-AuthZen's subject model (`type` + `id`) provides no mechanism for a caller to supply
-a subject's group memberships, and no guidance on how a PDP should resolve them when
-evaluating on behalf of another caller. The spec simply says "here is the subject, go
-decide" — it does not address the fact that the information needed to decide may live
-in a separate system the PDP cannot reach.
+AuthZen's subject model (`type` + `id`) provides no mechanism for a caller to supply a
+subject's group memberships. The spec says "here is the subject, go decide" — it does
+not address that the information needed to decide may live in a separate system.
 
-*Resolution — `subject.properties.groups` extension:*
-
-The fix is small and spec-compliant. AuthZen already defines `subject.properties` as
-an optional extensibility bag (same pattern as `resource.properties`). The caller
-passes alice's groups alongside her name:
-
-```json
-{
-  "subject": {
-    "type": "user",
-    "id": "alice",
-    "properties": { "groups": "sre-team,system:authenticated" }
-  }
-}
-```
-
-The PDP builds a full `user.Info{Name: "alice", Groups: ["sre-team", ...]}` and the
-cache lookup resolves both direct and group-inherited permissions correctly.
-
-In ACM's architecture, consumers (Search, Console) always operate on behalf of an
-authenticated user whose bearer token is present in the request. A `TokenReview`
-against the hub kube-apiserver returns the user's full identity including all group
-memberships. The caller has everything it needs to populate `subject.properties.groups`
-without any additional IDP integration.
-
-This extension is not implemented today because no consumer has integrated with these
-endpoints yet. However, it **must be implemented before MVP**. In Kubernetes, most
-permissions flow through groups — `cluster-admin` via `system:masters`, team access
-via group bindings. Shipping the endpoints without this fix means the PDP returns
-wrong answers for the majority of real users. Silent incorrectness in an authorization
-service is not an acceptable MVP trade-off.
+**This is addressed by the `subject.properties.groups` extension (section A).** Callers
+do a `TokenReview` on the user's bearer token, get full group membership, and pass it
+alongside the subject ID. The PDP resolves everything correctly. The spec's own
+`subject.properties` extensibility makes this compliant — no deviation.
 
 ---
 
 ### D. Spec Features Not Yet Implemented
 
-These are actual gaps against the AuthZen spec. Each is either deferred with a
-rationale or flagged as needing a decision. See the MVP Action Items table for
-which of these must be closed before an external review.
-
-**Batch `executeStrategy` / `semantics` field — always runs `execute_all`.**
-
-AuthZen's batch evaluation endpoint defines three execution semantics: `execute_all`
-(run all, return all results), `deny_on_first_deny` (short-circuit on first denial —
-logical AND), `permit_on_first_permit` (short-circuit on first permit — logical OR).
-The current implementation silently ignores any `semantics` field and always runs
-`execute_all`. *Must be closed before MVP.*
-
-**Discovery document does not follow the AuthZen spec format.**
-
-The `/.well-known/authzen-configuration` endpoint returns a non-standard key structure.
-This is the first endpoint a compliance reviewer will check. *Must be closed before MVP.*
-
-**Resource type taxonomy is unresolved.**
-
-The convention for mapping Kubernetes `apiGroup+resource` to the AuthZen `resource.type`
-string is not established. Tests use `"virtualmachines"` and `"virtualmachines.kubevirt.io"`
-inconsistently. This must be frozen before any consumer integrates — it is a breaking
-API change after the fact. *Must be closed before MVP.*
+Only two remain. Everything else from the original list has been implemented or resolved.
 
 **`search/action` endpoint — not yet implemented.**
 
 AuthZen defines this as "what actions can this subject perform on this resource?" It is
-the simplest of the unimplemented endpoints (collect all verbs the subject has on the
-given cluster). Without it, the implementation covers 3 of 5 AuthZen endpoint types.
+the simplest of the unimplemented endpoints: collect all verbs the subject has on the
+given cluster. Without it, the implementation covers 3 of 5 AuthZen endpoint types.
 *Recommended for MVP — see action items.*
 
 **`search/subject` (inverse query) — explicitly deferred.**
@@ -258,60 +277,25 @@ consumers. *Deferred until `evaluation` and `search/resource` are proven in prod
 
 ---
 
-## Correctness Issues
-
-**`namespace == ""` creates false positives in `bindingCovers`** (`decider.go:114`)
-
-```go
-if ns == "*" || ns == namespace || namespace == "" {
-    return true
-}
-```
-
-If a caller omits `namespace` from `resource.properties`, the empty string matches any
-binding, including namespace-scoped bindings for specific namespaces. A user with access
-only to `alpha` on cluster `bar` receives `decision: true` for a query with no namespace
-specified — a false allow. This is a correctness bug with a security implication. Callers
-should be required to pass `"*"` explicitly for cluster-scoped intent.
-
----
-
-## Operational Issues
-
-**`klog.Infof` on every impersonation SAR** (`handler.go:188`)
-
-Fires on every cross-subject query. At Search's query frequency, this floods the default
-log level. Downgrade to `klog.V(4).Infof`.
-
-**`EvaluateBatch` is O(P×R)** (`decider.go:54`)
-
-For each resource in the batch, the implementation scans all permissions linearly.
-At POC scale this is acceptable. Under real Search load (100-item batches across 50
-concurrent users), building the permission index once per batch call and doing O(1)
-lookups per resource will be necessary.
-
----
-
 ## MVP Action Items
 
-Items are sequenced by impact in an API review. Items 1-6 should be completed before
-any external review. Item 7 is worth the investment given the scrutiny context.
-Items 8 onward are post-MVP.
-
-| # | Priority | Action | Why it matters in review |
-|---|---|---|---|
-| 1 | **Must** | Establish `{resource}.{group}` resource type taxonomy; encode in discovery response and validate in handlers | First question in any API review; breaking change if deferred past consumer integration |
-| 2 | **Must** | Fix discovery document to follow AuthZen spec format | First thing an AuthZen compliance reviewer checks |
-| 3 | **Must** | Add `semantics` field to `EvaluationsRequest` (`execute_all` / `deny_on_first_deny` / `permit_on_first_permit`) | Spec gap; low implementation cost; real consumer value |
-| 4 | **Must** | Fix `namespace == ""` false positive in `bindingCovers` | Security finding if caught in a demo or review |
-| 5 | **Must** | Document impersonation group-resolution limitation in discovery response, OpenAPI spec, and architecture doc | Will be found by any reviewer who tests `kube:admin` via impersonation |
-| 6 | **Must** | Downgrade impersonation SAR log from `klog.Infof` to `klog.V(4).Infof` | Trivial; avoids log noise being flagged in demo |
-| 7 | **Argue for** | Implement `search/action` endpoint | 4/5 AuthZen endpoints is a defensible position; 3/5 is not |
-| 8 | **Defer** | Optimize `EvaluateBatch` to build permission index once | Performance, not correctness; becomes relevant under real Search load |
-| 9 | **Must** | Implement `subject.properties.groups` extension for cross-subject group resolution | In Kubernetes, most permissions flow through groups. Without this, the PDP silently returns wrong answers for the majority of real users. Callers already have alice's bearer token and can get groups via a single `TokenReview` — no IDP integration required. |
-| 10 | **Defer** | Add rate limiting on AuthZen `NonGoRestfulMux` paths | Have an answer ready ("global GenericAPIServer rate limiting applies"); don't spend MVP time here |
-| 11 | **Defer** | Add cache readiness signal to discovery response | Operationally valuable; not a review blocker |
-| 12 | **Defer** | Add structured audit logging for authorization decisions | Important for compliance customers; verify that GenericAPIServer audit middleware covers these paths first |
+| # | Status | Priority | Action | Notes |
+|---|---|---|---|---|
+| 1 | **OPEN** | **Must** | Establish resource type taxonomy (`{resource}.{group}` convention); freeze in discovery and validate in handlers | Only Must still open. Breaking change if deferred past consumer integration. |
+| 2 | **DONE** | ~~Must~~ | Discovery — spec-compliant field names, absolute HTTPS URLs | ✓ Verified in `handler.go`. **Follow-up F1:** field names inconsistent with `authzen-api.yaml`. |
+| 3 | **DONE** | ~~Must~~ | Batch `options.evaluations_semantic` short-circuit semantics | ✓ Verified. **Caveat:** short-circuit is in handler response loop only — `EvaluateBatch` still evaluates all items in the decider. Semantically correct; not a performance short-circuit. |
+| 4 | **DONE** | ~~Must~~ | Fix `namespace == ""` false positive in `bindingCovers` | ✓ Verified. `namespace == ""` branch removed; comment added. |
+| 5 | **DONE** | ~~Must~~ | Document group resolution limitation | ✓ Verified. Superseded by #9. **Follow-up F2:** OpenAPI YAML `Subject` schema still says `properties` "not supported". |
+| 6 | **DONE** | ~~Must~~ | `klog.Infof` → `klog.V(4).Infof` on SAR logs | ✓ Verified. Both log lines downgraded. |
+| 7 | **OPEN** | Argue for | `search/action` endpoint | New endpoint; lowest urgency among missing ones. |
+| 8 | **DEFER** | Defer | `EvaluateBatch` O(P×R) optimization | Performance not correctness; revisit under real Search load. |
+| 9 | **DONE** | ~~Must~~ | `subject.properties.groups` for cross-subject group resolution | ✓ Verified. `Subject.Properties`, `parseGroups`, `subjectUserInfo` all implemented. |
+| 10 | **DEFER** | Defer | Rate limiting on AuthZen paths | GenericAPIServer covers it; have the answer ready. |
+| 11 | **DEFER** | Defer | Cache readiness signal in discovery | Nice-to-have operationally. |
+| 12 | **DEFER** | Defer | Structured audit logging | Verify GenericAPIServer audit covers these paths first. |
+| — | **DEFER** | Defer | `search/subject` (inverse query) | Requires cache internal change; least-demanded endpoint. |
+| F1 | **OPEN** | Must | Sync discovery field names between `handler.go` and `authzen-api.yaml` | Found during verification. One of them is wrong against the spec. |
+| F2 | **OPEN** | Must | Update OpenAPI YAML `Subject` schema — `subject.properties` is now supported | Found during verification. Currently says "not supported" which is wrong since #9. |
 
 ---
 
@@ -328,11 +312,11 @@ Specific answers to prepare:
 
 | Likely reviewer challenge | Answer |
 |---|---|
-| "Your `search/resource` doesn't return resource instances" | "AuthZen assumes a PDP that is also a resource catalog. Ours is a permission-scope server. Returning (cluster, namespace) pairs is the only O(1) design at fleet scale. Search intersects those scopes with its own index." |
-| "You're missing the `semantics` field on batch" | "Being added in MVP — it was missing in the POC." |
+| "Your `search/resource` doesn't return resource instances" | "Our PDP is a permission-scope server, not a resource catalog. Returning (cluster, namespace) pairs is the only O(1) design at fleet scale. Search intersects those scopes with its own index. Coupling the PDP to Search's resource inventory would create a circular dependency." |
+| "You're missing the `semantics` field on batch" | "Implemented — `options.evaluations_semantic` supports `execute_all`, `deny_on_first_deny`, and `permit_on_first_permit`." |
 | "You're missing `search/action`" | "Being added before the external review." OR "Explicitly deferred with a timeline." |
 | "You're missing `search/subject`" | "Explicitly deferred. The cache has no public enumeration method today; adding it safely is the sequencing constraint." |
-| "Cross-subject queries lose group permissions" | "Being fixed in MVP via `subject.properties.groups` — callers pass the subject's groups alongside their name. Callers already hold the user's bearer token and resolve groups via a single `TokenReview`. This is a spec-compliant use of AuthZen's `subject.properties` extensibility." |
+| "Cross-subject queries lose group permissions" | "Addressed via `subject.properties.groups` — callers pass the subject's groups alongside their name. Callers hold the user's bearer token and resolve groups via a single `TokenReview`. This is spec-compliant use of AuthZen's `subject.properties` extensibility." |
 | "AuthZen is a new and immature standard" | "Correct. We align with it for its type-agnostic resource model, built-in batch semantics, and standards trajectory — not because it fully solves the multicluster problem today. Where it falls short, we have documented ACM-specific adaptations." |
 
 ---

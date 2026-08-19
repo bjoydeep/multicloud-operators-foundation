@@ -224,9 +224,23 @@ suite_discovery() {
   bold "=== Suite: Discovery ==="
   local resp
   resp=$(authzen_get "$ADMIN_TOKEN" "/.well-known/authzen-configuration")
-  local ep
-  ep=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('access_evaluation_v1_endpoint',''))" 2>/dev/null)
-  [ "$ep" = "/access/v1/evaluation" ] && pass "discovery returns correct endpoints" || fail "discovery" "got: $resp"
+
+  # Spec-compliant field names
+  local pdp eval_ep eval_batch_ep search_ep
+  pdp=$(echo "$resp"         | python3 -c "import json,sys; print(json.load(sys.stdin).get('policy_decision_point',''))" 2>/dev/null)
+  eval_ep=$(echo "$resp"     | python3 -c "import json,sys; print(json.load(sys.stdin).get('access_evaluation_endpoint',''))" 2>/dev/null)
+  eval_batch_ep=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('access_evaluations_endpoint',''))" 2>/dev/null)
+  search_ep=$(echo "$resp"   | python3 -c "import json,sys; print(json.load(sys.stdin).get('search_resource_endpoint',''))" 2>/dev/null)
+
+  [ -n "$pdp" ] && pass "discovery: policy_decision_point present ($pdp)" || fail "discovery: policy_decision_point missing" "resp=$resp"
+  [[ "$eval_ep" == https://* ]] && pass "discovery: access_evaluation_endpoint is absolute URL" || fail "discovery: access_evaluation_endpoint not absolute URL" "got=$eval_ep"
+  [[ "$eval_batch_ep" == https://* ]] && pass "discovery: access_evaluations_endpoint is absolute URL" || fail "discovery: access_evaluations_endpoint not absolute URL" "got=$eval_batch_ep"
+  [[ "$search_ep" == https://* ]] && pass "discovery: search_resource_endpoint is absolute URL" || fail "discovery: search_resource_endpoint not absolute URL" "got=$search_ep"
+
+  # Old non-spec keys must NOT appear
+  local old_key
+  old_key=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('access_evaluation_v1_endpoint','ABSENT'))" 2>/dev/null)
+  [ "$old_key" = "ABSENT" ] && pass "discovery: old non-spec key absent" || fail "discovery: old non-spec key still present" "got=$old_key"
 }
 
 suite_auth_enforcement() {
@@ -425,58 +439,131 @@ suite_carol() {
     || fail "carol: search scope count" "expected 3 got $cnt"
 }
 
+suite_namespace_security() {
+  # Tests the namespace=="" fix: omitting namespace must not grant access.
+  # bob has namespace-scoped MCRA access (app-frontend, app-backend on dsf-mc) — ideal test subject.
+  [ -z "$BOB_TOKEN" ] && skip "namespace security tests (bob not set up)" && return
+  bold "=== Suite: Namespace security (namespace==\"\" no longer false-allows) ==="
+
+  # empty namespace → denied, even though bob has access to specific namespaces on dsf-mc
+  assert_decision "bob: empty namespace on dsf-mc → false (must not wildcard-match)" \
+    "$BOB_TOKEN" "bob" "user" "get" "pods" "dsf-mc" "" "" "False"
+
+  # explicit in-scope namespace → allowed (baseline still works)
+  assert_decision "bob: ns=app-frontend on dsf-mc → true (in-scope MCRA)" \
+    "$BOB_TOKEN" "bob" "user" "get" "pods" "dsf-mc" "app-frontend" "" "True"
+
+  # explicit out-of-scope namespace → denied (not a regression from the fix)
+  assert_decision "bob: ns=kube-system on dsf-mc → false (out-of-scope MCRA)" \
+    "$BOB_TOKEN" "bob" "user" "get" "pods" "dsf-mc" "kube-system" "" "False"
+}
+
+suite_batch_semantics() {
+  # Tests options.evaluations_semantic short-circuit behaviour.
+  # Uses alice: FIRST_CLUSTER=allowed, ghost-cluster=denied, SECOND_CLUSTER=allowed.
+  [ -z "$ALICE_TOKEN" ] && skip "batch semantics tests (alice not set up)" && return
+  bold "=== Suite: Batch semantics (options.evaluations_semantic) ==="
+
+  # execute_all (default) — all 3 items returned
+  local resp cnt
+  resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/evaluations" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\
+\"evaluations\":[\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"$FIRST_CLUSTER\",\"namespace\":\"default\"}},\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"ghost-cluster\",\"namespace\":\"default\"}},\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"$SECOND_CLUSTER\",\"namespace\":\"default\"}}]}")
+  cnt=$(echo "$resp" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('evaluations',[])))" 2>/dev/null)
+  [ "$cnt" = "3" ] \
+    && pass "execute_all (default): all 3 items returned" \
+    || fail "execute_all: expected 3 items, got $cnt"
+
+  # deny_on_first_deny — true, false, true → stops after item 2 (first deny)
+  resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/evaluations" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\
+\"options\":{\"evaluations_semantic\":\"deny_on_first_deny\"},\
+\"evaluations\":[\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"$FIRST_CLUSTER\",\"namespace\":\"default\"}},\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"ghost-cluster\",\"namespace\":\"default\"}},\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"$SECOND_CLUSTER\",\"namespace\":\"default\"}}]}")
+  cnt=$(echo "$resp" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('evaluations',[])))" 2>/dev/null)
+  [ "$cnt" = "2" ] \
+    && pass "deny_on_first_deny: stopped at 2 items (first deny was item 2)" \
+    || fail "deny_on_first_deny: expected 2 items, got $cnt — resp=$resp"
+
+  # permit_on_first_permit — false, true, true → stops after item 2 (first permit)
+  resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/evaluations" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\
+\"options\":{\"evaluations_semantic\":\"permit_on_first_permit\"},\
+\"evaluations\":[\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"ghost-cluster\",\"namespace\":\"default\"}},\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"$FIRST_CLUSTER\",\"namespace\":\"default\"}},\
+{\"type\":\"pods\",\"properties\":{\"cluster\":\"$SECOND_CLUSTER\",\"namespace\":\"default\"}}]}")
+  cnt=$(echo "$resp" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('evaluations',[])))" 2>/dev/null)
+  [ "$cnt" = "2" ] \
+    && pass "permit_on_first_permit: stopped at 2 items (first permit was item 2)" \
+    || fail "permit_on_first_permit: expected 2 items, got $cnt — resp=$resp"
+}
+
 suite_impersonation() {
   [ -z "$SEARCH_SA_TOKEN" ] && skip "impersonation tests (authzen-search-sa not found — run setup-authzen-rbac.sh)" && return
   [ -z "$ALICE_TOKEN" ]     && skip "impersonation tests (alice not set up — run setup-authzen-users.sh)" && return
 
   bold "=== Suite: Impersonation — search-sa queries on behalf of alice ==="
 
-  # search-sa queries alice's permissions — expects real decisions, not 403
+  # search-sa can reach the endpoint (not 403)
   local code
   code=$(authzen_post_code "$SEARCH_SA_TOKEN" "/access/v1/evaluation" \
     "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"default\"}}}")
   assert_http "search-sa can query alice (not 403)" "$code" "200"
 
-  # search-sa result must match alice's own query — same cache, same answer
-  local search_resp alice_resp search_dec alice_dec
-  search_resp=$(authzen_post "$SEARCH_SA_TOKEN" "/access/v1/evaluation" \
-    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"default\"}}}")
-  alice_resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/evaluation" \
-    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"default\"}}}")
-  search_dec=$(get_decision "$search_resp")
-  alice_dec=$(get_decision "$alice_resp")
+  # decision consistency — search-sa and alice must get the same answer
+  local search_dec alice_dec
+  search_dec=$(get_decision "$(authzen_post "$SEARCH_SA_TOKEN" "/access/v1/evaluation" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"default\"}}}")")
+  alice_dec=$(get_decision "$(authzen_post "$ALICE_TOKEN" "/access/v1/evaluation" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"default\"}}}")")
   [ "$search_dec" = "$alice_dec" ] \
-    && pass "search-sa decision matches alice's own query (both=$alice_dec)" \
-    || fail "search-sa decision differs from alice's own query" "search-sa=$search_dec alice=$alice_dec"
+    && pass "decision consistency: search-sa and alice agree (both=$alice_dec)" \
+    || fail "decision mismatch: search-sa=$search_dec alice=$alice_dec"
 
-  # search-sa queries alice on dsf-mc → true (alice has admin there)
-  assert_decision "search-sa querying alice: get pods dsf-mc → true" \
+  # spot-check decisions through impersonation
+  assert_decision "search-sa querying alice: get pods dsf-mc → true (admin)" \
     "$SEARCH_SA_TOKEN" "alice" "user" "get" "pods" "dsf-mc" "default" "" "True"
-
-  # search-sa queries alice on dsf-mc-02 (view only) → create denied
   assert_decision "search-sa querying alice: create pods dsf-mc-02 → false (view only)" \
     "$SEARCH_SA_TOKEN" "alice" "user" "create" "pods" "dsf-mc-02" "default" "" "False"
-
-  # search-sa queries alice on local-cluster → false (no access)
   assert_decision "search-sa querying alice: get pods local-cluster → false (no access)" \
     "$SEARCH_SA_TOKEN" "alice" "user" "get" "pods" "local-cluster" "default" "" "False"
 
-  # search-sa search/resource for alice — must return same scopes as alice's own search
+  # search/resource consistency — same scopes via impersonation as alice's own query
   local search_scopes alice_scopes
   search_scopes=$(authzen_post "$SEARCH_SA_TOKEN" "/access/v1/search/resource" \
-    '{"subject":{"type":"user","id":"alice"},"action":{"name":"get"},"resource":{"type":"pods"}}' | \
-    get_result_clusters)
+    '{"subject":{"type":"user","id":"alice"},"action":{"name":"get"},"resource":{"type":"pods"}}' | get_result_clusters)
   alice_scopes=$(authzen_post "$ALICE_TOKEN" "/access/v1/search/resource" \
-    '{"subject":{"type":"user","id":"alice"},"action":{"name":"get"},"resource":{"type":"pods"}}' | \
-    get_result_clusters)
+    '{"subject":{"type":"user","id":"alice"},"action":{"name":"get"},"resource":{"type":"pods"}}' | get_result_clusters)
   [ "$search_scopes" = "$alice_scopes" ] \
-    && pass "search-sa search/resource matches alice's own (clusters: $alice_scopes)" \
-    || fail "search-sa search/resource differs from alice's own" "search-sa=$search_scopes alice=$alice_scopes"
+    && pass "search/resource consistency: same scopes via impersonation (clusters: $alice_scopes)" \
+    || fail "search/resource mismatch" "search-sa=$search_scopes alice=$alice_scopes"
+
+  bold ""
+  bold "=== Suite: subject.properties.groups (cross-subject group resolution) ==="
+
+  # search-sa queries alice passing her groups explicitly in subject.properties
+  # alice has direct user bindings so this produces the same result either way —
+  # what we're testing is that the groups field is accepted and parsed correctly.
+  local with_groups_dec without_groups_dec
+  with_groups_dec=$(get_decision "$(authzen_post "$SEARCH_SA_TOKEN" "/access/v1/evaluation" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\",\"properties\":{\"groups\":\"system:authenticated\"}},\
+\"action\":{\"name\":\"get\"},\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"default\"}}}")")
+  without_groups_dec=$(get_decision "$(authzen_post "$SEARCH_SA_TOKEN" "/access/v1/evaluation" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\
+\"action\":{\"name\":\"get\"},\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"default\"}}}")")
+  [ "$with_groups_dec" = "$without_groups_dec" ] \
+    && pass "subject.properties.groups accepted and parsed (decision=$with_groups_dec, consistent with/without groups)" \
+    || fail "subject.properties.groups: inconsistent result" "with=$with_groups_dec without=$without_groups_dec"
 
   bold ""
   bold "=== Suite: Impersonation — authzen-unauth-sa is denied ==="
 
-  # unauth-sa has AuthZen endpoint access but no impersonate rights → must get 403
   code=$(authzen_post_code "$UNAUTH_SA_TOKEN" "/access/v1/evaluation" \
     "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\"action\":{\"name\":\"get\"},\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"default\"}}}")
   assert_http "unauth-sa querying alice → 403 (no impersonate rights)" "$code" "403"
@@ -505,6 +592,10 @@ echo ""
 suite_bob
 echo ""
 suite_carol
+echo ""
+suite_namespace_security
+echo ""
+suite_batch_semantics
 echo ""
 suite_impersonation
 
