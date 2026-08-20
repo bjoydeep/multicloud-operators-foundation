@@ -241,6 +241,16 @@ suite_discovery() {
   local old_key
   old_key=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('access_evaluation_v1_endpoint','ABSENT'))" 2>/dev/null)
   [ "$old_key" = "ABSENT" ] && pass "discovery: old non-spec key absent" || fail "discovery: old non-spec key still present" "got=$old_key"
+
+  # Resource type convention advertised
+  local convention
+  convention=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('resource_type_convention',''))" 2>/dev/null)
+  [ "$convention" = "resource_name_only" ] && pass "discovery: resource_type_convention=resource_name_only" || fail "discovery: resource_type_convention missing" "got=$convention"
+
+  # search/action endpoint advertised
+  local action_ep
+  action_ep=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('search_action_endpoint',''))" 2>/dev/null)
+  [[ "$action_ep" == https://* ]] && pass "discovery: search_action_endpoint is absolute URL" || fail "discovery: search_action_endpoint missing or not absolute" "got=$action_ep"
 }
 
 suite_auth_enforcement() {
@@ -439,6 +449,61 @@ suite_carol() {
     || fail "carol: search scope count" "expected 3 got $cnt"
 }
 
+suite_search_action() {
+  bold "=== Suite: search/action (what verbs can subject do on resource?) ==="
+
+  [ -z "$ALICE_TOKEN" ] && skip "search/action tests (alice not set up)" && return
+
+  local resp verbs cnt
+  # alice has admin on dsf-mc → ≥7 verbs (wildcard expanded)
+  resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/search/action" \
+    '{"subject":{"type":"user","id":"alice"},"resource":{"type":"pods","properties":{"cluster":"dsf-mc","namespace":"default","apiGroup":""}}}')
+  verbs=$(echo "$resp" | python3 -c "import json,sys; print(sorted([a['name'] for a in json.load(sys.stdin).get('actions',[])]))" 2>/dev/null)
+  cnt=$(echo "$resp"   | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('actions',[])))" 2>/dev/null)
+  [ "$cnt" -ge 7 ] \
+    && pass "search/action: alice admin on dsf-mc returns $cnt verbs: $verbs" \
+    || fail "search/action: alice admin on dsf-mc expected ≥7 verbs, got $cnt — $verbs"
+
+  # alice has VIEW on dsf-mc-02 → only get/list/watch
+  resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/search/action" \
+    '{"subject":{"type":"user","id":"alice"},"resource":{"type":"pods","properties":{"cluster":"dsf-mc-02","namespace":"default","apiGroup":""}}}')
+  cnt=$(echo "$resp"   | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('actions',[])))" 2>/dev/null)
+  verbs=$(echo "$resp" | python3 -c "import json,sys; print(sorted([a['name'] for a in json.load(sys.stdin).get('actions',[])]))" 2>/dev/null)
+  [ "$cnt" = "3" ] \
+    && pass "search/action: alice view on dsf-mc-02 returns 3 verbs: $verbs" \
+    || fail "search/action: alice view on dsf-mc-02 expected 3 verbs (get/list/watch), got $cnt — $verbs"
+
+  # no-access cluster → empty list
+  resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/search/action" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"alice\"},\
+\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"ghost-cluster\",\"namespace\":\"default\",\"apiGroup\":\"\"}}}")
+  cnt=$(echo "$resp" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('actions',[])))" 2>/dev/null)
+  [ "$cnt" = "0" ] \
+    && pass "search/action: ghost-cluster returns empty list" \
+    || fail "search/action: ghost-cluster should return empty, got $cnt"
+
+  # bob MCRA (workload-admin) on dsf-mc/app-frontend → create allowed
+  [ -z "$BOB_TOKEN" ] && return
+  resp=$(authzen_post "$BOB_TOKEN" "/access/v1/search/action" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"bob\"},\
+\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc\",\"namespace\":\"$NS_FAKE_1\",\"apiGroup\":\"\"}}}")
+  verbs=$(echo "$resp" | python3 -c "import json,sys; print(sorted([a['name'] for a in json.load(sys.stdin).get('actions',[])]))" 2>/dev/null)
+  has_create=$(echo "$resp" | python3 -c "import json,sys; print('create' in [a['name'] for a in json.load(sys.stdin).get('actions',[])])" 2>/dev/null)
+  [ "$has_create" = "True" ] \
+    && pass "search/action: bob workload-admin on $NS_FAKE_1 includes create: $verbs" \
+    || fail "search/action: bob workload-admin should include create, got $verbs"
+
+  # bob MCRA (workload-view) on dsf-mc-02/openshift-monitoring → create NOT allowed
+  resp=$(authzen_post "$BOB_TOKEN" "/access/v1/search/action" \
+    "{\"subject\":{\"type\":\"user\",\"id\":\"bob\"},\
+\"resource\":{\"type\":\"pods\",\"properties\":{\"cluster\":\"dsf-mc-02\",\"namespace\":\"$NS_REAL\",\"apiGroup\":\"\"}}}")
+  has_create=$(echo "$resp" | python3 -c "import json,sys; print('create' in [a['name'] for a in json.load(sys.stdin).get('actions',[])])" 2>/dev/null)
+  has_get=$(echo "$resp"    | python3 -c "import json,sys; print('get' in [a['name'] for a in json.load(sys.stdin).get('actions',[])])" 2>/dev/null)
+  [ "$has_create" = "False" ] && [ "$has_get" = "True" ] \
+    && pass "search/action: bob workload-view on $NS_REAL has get but not create" \
+    || fail "search/action: bob view expected get=True create=False, got get=$has_get create=$has_create"
+}
+
 suite_namespace_security() {
   # Tests the namespace=="" fix: omitting namespace must not grant access.
   # bob has namespace-scoped MCRA access (app-frontend, app-backend on dsf-mc) — ideal test subject.
@@ -594,6 +659,8 @@ echo ""
 suite_carol
 echo ""
 suite_namespace_security
+echo ""
+suite_search_action
 echo ""
 suite_batch_semantics
 echo ""

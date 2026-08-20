@@ -2,13 +2,13 @@
 
 | Field | Value |
 |---|---|
-| **Last reviewed** | 2026-08-18 15:31 PDT |
+| **Last reviewed** | 2026-08-18 16:04 PDT |
 | **Reviewer** | Joydeep Banerjee |
 | **Scope** | Phase 3 MVP — AuthZen endpoints in `ocm-proxyserver` |
 | **Parent DDR** | ACM-DDR-083 |
 | **Code reviewed** | `pkg/proxyserver/authzen/`, `pkg/proxyserver/api/register.go`, `cmd/proxyserver/app/server.go` |
 | **API spec reviewed** | `docs/proxyserver/authzen-api.yaml` |
-| **Status** | 1 Must open (#1 resource type taxonomy). 2 follow-up issues found during verification — see below. |
+| **Status** | 2 items open before external review: #1 (resource type taxonomy — needs design decision) and #7 (search/action — ~2-3h implementation). Everything else done or explicitly deferred. |
 
 ---
 
@@ -18,53 +18,12 @@ Code was read directly to confirm each claimed fix. Results:
 
 | # | Claimed fix | Verified? | Notes |
 |---|---|---|---|
-| #2 | Discovery — spec-compliant field names, absolute HTTPS URLs | ✓ | Field names in `handler.go` and `authzen-api.yaml` are now **inconsistent** — see follow-up items |
-| #3 | Batch `options.evaluations_semantic` with short-circuit | ✓ | Short-circuit truncates the **response**, but `EvaluateBatch` in `decider.go` still evaluates all items — see follow-up items |
-| #4 | `namespace == ""` false positive removed from `bindingCovers` | ✓ | Clean fix; comment added |
-| #5 | Group resolution limitation documented | ✓ | Superseded by #9; OpenAPI YAML `Subject` schema still says `properties` "not supported" — see follow-up items |
-| #6 | `klog.Infof` → `klog.V(4).Infof` on SAR logs | ✓ | Both log lines downgraded |
-| #9 | `subject.properties.groups` extension implemented | ✓ | `Subject.Properties`, `parseGroups`, and `subjectUserInfo` all verified |
-
----
-
-## Follow-up Items Found During Verification
-
-These were not in the original action items list. Both are small but must be resolved
-before the OpenAPI spec is shared externally.
-
-**F1 — OpenAPI YAML and `handler.go` use different discovery field names.**
-
-`handler.go` (current code):
-```go
-"access_evaluation_endpoint":   base + "/access/v1/evaluation"
-"access_evaluations_endpoint":  base + "/access/v1/evaluations"
-"search_resource_endpoint":     base + "/access/v1/search/resource"
-```
-
-`authzen-api.yaml` `AuthzenConfiguration` schema (not yet updated):
-```yaml
-access_evaluation_v1_endpoint:   ...
-access_evaluations_v1_endpoint:  ...
-access_search_resource_v1_endpoint: ...
-```
-
-The code removed the `_v1_` infix and changed `access_search_resource` to
-`search_resource`. The YAML schema needs to be updated to match before the spec is
-shared. One of them is also wrong against the AuthZen spec itself — needs a check
-against the published spec to confirm which naming the standard uses.
-
-**F2 — OpenAPI YAML `Subject` schema still says `properties` is "not supported".**
-
-Since #9 implemented `subject.properties.groups`, the `Subject` schema description
-in `authzen-api.yaml` is now outdated:
-
-```yaml
-# Still says this — wrong since #9:
-**AuthZen spec deviation:** The spec allows an optional `properties` map
-for extensibility. This is not supported.
-```
-
-This needs to be updated to document the supported `groups` key and its format.
+| #2 | Discovery — spec-compliant field names, absolute HTTPS URLs | ✓ | F1 flagged in prior review was already fixed in the YAML — reviewer was checking an older version. Field names match. |
+| #3 | Batch `options.evaluations_semantic` with short-circuit | ✓ | Short-circuit truncates the **response** correctly. `EvaluateBatch` in `decider.go` still evaluates all items — API semantics are correct, this is a performance gap only. Folded into deferred item #8. |
+| #4 | `namespace == ""` false positive removed from `bindingCovers` | ✓ | Clean fix; comment added. |
+| #5 | Group resolution limitation documented | ✓ | Superseded by #9. F2 (stale description in `/evaluation` endpoint description) is now fixed. The `Action` schema correctly notes `action.properties` is not supported — accurate, stays as-is. |
+| #6 | `klog.Infof` → `klog.V(4).Infof` on SAR logs | ✓ | Both log lines downgraded. |
+| #9 | `subject.properties.groups` extension implemented | ✓ | `Subject.Properties`, `parseGroups`, and `subjectUserInfo` all verified. |
 
 ---
 
@@ -281,21 +240,19 @@ consumers. *Deferred until `evaluation` and `search/resource` are proven in prod
 
 | # | Status | Priority | Action | Notes |
 |---|---|---|---|---|
-| 1 | **OPEN** | **Must** | Establish resource type taxonomy (`{resource}.{group}` convention); freeze in discovery and validate in handlers | Only Must still open. Breaking change if deferred past consumer integration. |
-| 2 | **DONE** | ~~Must~~ | Discovery — spec-compliant field names, absolute HTTPS URLs | ✓ Verified in `handler.go`. **Follow-up F1:** field names inconsistent with `authzen-api.yaml`. |
-| 3 | **DONE** | ~~Must~~ | Batch `options.evaluations_semantic` short-circuit semantics | ✓ Verified. **Caveat:** short-circuit is in handler response loop only — `EvaluateBatch` still evaluates all items in the decider. Semantically correct; not a performance short-circuit. |
-| 4 | **DONE** | ~~Must~~ | Fix `namespace == ""` false positive in `bindingCovers` | ✓ Verified. `namespace == ""` branch removed; comment added. |
-| 5 | **DONE** | ~~Must~~ | Document group resolution limitation | ✓ Verified. Superseded by #9. **Follow-up F2:** OpenAPI YAML `Subject` schema still says `properties` "not supported". |
-| 6 | **DONE** | ~~Must~~ | `klog.Infof` → `klog.V(4).Infof` on SAR logs | ✓ Verified. Both log lines downgraded. |
-| 7 | **OPEN** | Argue for | `search/action` endpoint | New endpoint; lowest urgency among missing ones. |
-| 8 | **DEFER** | Defer | `EvaluateBatch` O(P×R) optimization | Performance not correctness; revisit under real Search load. |
-| 9 | **DONE** | ~~Must~~ | `subject.properties.groups` for cross-subject group resolution | ✓ Verified. `Subject.Properties`, `parseGroups`, `subjectUserInfo` all implemented. |
+| 1 | **OPEN** | **Must** | Establish resource type taxonomy (`{resource}.{group}` convention); freeze in discovery and validate in handlers | Only Must still open. Needs a design decision. Breaking change if deferred past consumer integration. |
+| 2 | **DONE** | ~~Must~~ | Discovery — spec-compliant field names, absolute HTTPS URLs | ✓ F1 (field name mismatch) was already fixed in the YAML — reviewer was on an older version. |
+| 3 | **DONE** | ~~Must~~ | Batch `options.evaluations_semantic` short-circuit semantics | ✓ API contract is correct. Performance optimization (stopping evaluation early in the decider) is a separate concern folded into #8. |
+| 4 | **DONE** | ~~Must~~ | Fix `namespace == ""` false positive in `bindingCovers` | ✓ |
+| 5 | **DONE** | ~~Must~~ | Document group resolution limitation | ✓ Superseded by #9. F2 (stale endpoint description) now fixed. |
+| 6 | **DONE** | ~~Must~~ | `klog.Infof` → `klog.V(4).Infof` on SAR logs | ✓ |
+| 7 | **OPEN** | Argue for | `search/action` endpoint | ~2-3h implementation. 4/5 AuthZen endpoint types is a much stronger review position than 3/5. |
+| 8 | **DEFER** | Defer | `EvaluateBatch` full short-circuit in decider + O(P×R) optimization | Performance only — API semantics are correct. Revisit under real Search load. |
+| 9 | **DONE** | ~~Must~~ | `subject.properties.groups` for cross-subject group resolution | ✓ |
 | 10 | **DEFER** | Defer | Rate limiting on AuthZen paths | GenericAPIServer covers it; have the answer ready. |
 | 11 | **DEFER** | Defer | Cache readiness signal in discovery | Nice-to-have operationally. |
 | 12 | **DEFER** | Defer | Structured audit logging | Verify GenericAPIServer audit covers these paths first. |
 | — | **DEFER** | Defer | `search/subject` (inverse query) | Requires cache internal change; least-demanded endpoint. |
-| F1 | **OPEN** | Must | Sync discovery field names between `handler.go` and `authzen-api.yaml` | Found during verification. One of them is wrong against the spec. |
-| F2 | **OPEN** | Must | Update OpenAPI YAML `Subject` schema — `subject.properties` is now supported | Found during verification. Currently says "not supported" which is wrong since #9. |
 
 ---
 

@@ -17,37 +17,66 @@ endpoints added to `ocm-proxyserver` as part of DDR-083 Phase 3.
 
 ---
 
+## Gotcha — adding new endpoints
+
+When a new AuthZen endpoint is added, the `authzen-test:client` and
+`authzen-test:impersonator` ClusterRoles must be updated to include the new
+non-resource URL — otherwise test users get a DelegatingAuthorization 403 before
+the request even reaches the handler.
+
+Both roles are defined in `setup-authzen-rbac.sh` under the `nonResourceURLs` list.
+Patch them on the live cluster if already deployed:
+
+```bash
+kubectl patch clusterrole authzen-test:client \
+  --type=json \
+  -p='[{"op":"add","path":"/rules/1/nonResourceURLs/-","value":"/access/v1/search/newpath"}]'
+
+kubectl patch clusterrole authzen-test:impersonator \
+  --type=json \
+  -p='[{"op":"add","path":"/rules/1/nonResourceURLs/-","value":"/access/v1/search/newpath"}]'
+```
+
+---
+
 ## Dev session workflow
 
 The MCE operator continuously reconciles the `MultiClusterEngine` CR and reverts any
 manual changes to the `ocm-proxyserver` deployment. Pause it via annotation — cleaner
 than scaling to 0 because the operator keeps running and manages all other MCE components
-normally. See `implementation-plan-authzen.md` for the full explanation.
+normally.
+
+The dev loop below is the **complete sequence** every iteration. Steps 3 and 4 are
+one-time per cluster session — skip them if already done.
 
 ```bash
-# --- Start of dev session ---
+# 1. Build (you changed the code — always start here)
+IMAGE_REGISTRY=quay.io/bjoydeep IMAGE_TAG=dev make images-amd64
 
-# 1. Pause MCE operator reconciliation (operator stays running, just stops reconciling MCE CR)
-#    Cleaner than scaling to 0 — other MCE components continue to be managed normally.
+# 2. Push
+podman push quay.io/bjoydeep/multicloud-manager:dev
+
+# 3. Pause MCE operator (ONCE per cluster session — skip if already paused)
 kubectl annotate multiclusterengine multiclusterengine \
   installer.multicluster.openshift.io/pause=true --overwrite
 
-# 2. RBAC patch for TLS profile watcher (check first, apply if MISSING)
+# 4. RBAC patch — check first, apply if MISSING (ONCE per cluster session)
 kubectl get clusterrole open-cluster-management:backplane:foundation -o json | \
   python3 -c "import json,sys; rules=json.load(sys.stdin)['rules']; \
   print('PRESENT' if any('config.openshift.io' in r.get('apiGroups',[]) for r in rules) else 'MISSING')"
-
+# Apply if MISSING:
 kubectl patch clusterrole open-cluster-management:backplane:foundation \
   --type=json \
   -p='[{"op":"add","path":"/rules/-","value":{"apiGroups":["config.openshift.io"],"resources":["apiservers"],"verbs":["get","list","watch"]}}]'
 
-# 3. Deploy dev image (imagePullPolicy: Always is already set)
-kubectl set image deployment/ocm-proxyserver \
-  -n multicluster-engine \
-  ocm-proxyserver=quay.io/bjoydeep/multicloud-manager:dev
+# 5. Verify push landed before restarting (avoids CDN propagation race)
+podman pull quay.io/bjoydeep/multicloud-manager:dev
+
+# 6. Restart — imagePullPolicy:Always guarantees fresh pull of :dev tag
+kubectl rollout restart deployment/ocm-proxyserver -n multicluster-engine
 kubectl rollout status deployment/ocm-proxyserver -n multicluster-engine --timeout=120s
 
-# 4. Run tests
+# 7. Test
 ./hack/test-authzen.sh
 
 # --- End of dev session ---

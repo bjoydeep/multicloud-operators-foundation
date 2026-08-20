@@ -299,6 +299,93 @@ func TestSearchResource_NamespacedBindingFilteredByResourceType(t *testing.T) {
 	}
 }
 
+// --- SearchAction ---
+
+func TestSearchAction_AdminReturnsAllVerbs(t *testing.T) {
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{adminPermission("bar")},
+	}})
+	verbs, err := d.SearchAction(ctx, alice,
+		Resource{Type: "pods", Properties: map[string]string{"cluster": "bar", "namespace": "default", "apiGroup": ""}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// admin wildcard (*) should expand to all standard verbs
+	verbSet := make(map[string]struct{})
+	for _, v := range verbs {
+		verbSet[v] = struct{}{}
+	}
+	for _, expected := range []string{"get", "list", "watch", "create", "update", "patch", "delete"} {
+		if _, ok := verbSet[expected]; !ok {
+			t.Errorf("expected verb %q in admin result, got %v", expected, verbs)
+		}
+	}
+}
+
+func TestSearchAction_ViewReturnsReadOnlyVerbs(t *testing.T) {
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{viewPermission("bar")},
+	}})
+	verbs, err := d.SearchAction(ctx, alice,
+		Resource{Type: "pods", Properties: map[string]string{"cluster": "bar", "namespace": "default", "apiGroup": ""}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verbSet := make(map[string]struct{})
+	for _, v := range verbs {
+		verbSet[v] = struct{}{}
+	}
+	for _, expected := range []string{"get", "list", "watch"} {
+		if _, ok := verbSet[expected]; !ok {
+			t.Errorf("view: expected verb %q, got %v", expected, verbs)
+		}
+	}
+	for _, denied := range []string{"create", "delete", "update", "patch"} {
+		if _, ok := verbSet[denied]; ok {
+			t.Errorf("view: should not have verb %q, got %v", denied, verbs)
+		}
+	}
+}
+
+func TestSearchAction_WrongClusterReturnsEmpty(t *testing.T) {
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{adminPermission("bar")},
+	}})
+	verbs, err := d.SearchAction(ctx, alice,
+		Resource{Type: "pods", Properties: map[string]string{"cluster": "baz", "namespace": "default", "apiGroup": ""}},
+	)
+	if err != nil || len(verbs) != 0 {
+		t.Errorf("expected empty verbs for wrong cluster, got %v err %v", verbs, err)
+	}
+}
+
+func TestSearchAction_NamespacedMCRAReturnsVerbs(t *testing.T) {
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"kubevirt.io"}, Resources: []string{"virtualmachines"}, Verbs: []string{"get", "list", "create"}},
+	}
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{namespacedPermission("bar", []string{"alpha"}, rules)},
+	}})
+
+	// in-scope namespace, correct resource → returns verbs
+	verbs, err := d.SearchAction(ctx, alice,
+		Resource{Type: "virtualmachines", Properties: map[string]string{"cluster": "bar", "namespace": "alpha", "apiGroup": "kubevirt.io"}},
+	)
+	if err != nil || len(verbs) != 3 {
+		t.Errorf("expected 3 verbs for in-scope MCRA, got %v err %v", verbs, err)
+	}
+
+	// out-of-scope namespace → empty
+	verbs, err = d.SearchAction(ctx, alice,
+		Resource{Type: "virtualmachines", Properties: map[string]string{"cluster": "bar", "namespace": "beta", "apiGroup": "kubevirt.io"}},
+	)
+	if err != nil || len(verbs) != 0 {
+		t.Errorf("expected empty verbs for out-of-scope namespace, got %v err %v", verbs, err)
+	}
+}
+
 func TestSearchResource_DeduplicatesScopes(t *testing.T) {
 	// Two permissions that both grant access to the same cluster/namespace
 	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{

@@ -21,9 +21,17 @@ type Action struct {
 }
 
 // Resource describes what is being accessed.
-// Type is the plural resource name (e.g. "configmaps", "virtualmachines.kubevirt.io").
-// ID is the specific resource name; omit for search queries.
-// Properties carries "cluster", "namespace", and "apiGroup".
+//
+// Convention (Option A — resource type taxonomy):
+//   - Type is the plural resource name ONLY: "pods", "deployments", "virtualmachines".
+//     It never includes the API group.
+//   - Properties["apiGroup"] carries the API group: "" for core, "apps", "kubevirt.io".
+//   - Together, Type + Properties["apiGroup"] uniquely identify the Kubernetes resource.
+//
+// Examples:
+//   pods (core)           → Type: "pods",            apiGroup: ""
+//   deployments (apps)    → Type: "deployments",     apiGroup: "apps"
+//   VMs (kubevirt)        → Type: "virtualmachines", apiGroup: "kubevirt.io"
 type Resource struct {
 	Type       string            `json:"type"`
 	ID         string            `json:"id,omitempty"`
@@ -87,6 +95,19 @@ type SearchResult struct {
 	Type       string            `json:"type"`
 	ID         string            `json:"id"`
 	Properties map[string]string `json:"properties"`
+}
+
+// SearchActionRequest is the body of POST /access/v1/search/action.
+// Answers: what actions can subject perform on this specific resource?
+// resource.properties.cluster, namespace, and apiGroup are all required.
+type SearchActionRequest struct {
+	Subject  Subject  `json:"subject"`
+	Resource Resource `json:"resource"`
+}
+
+// SearchActionResponse is returned by the search/action endpoint.
+type SearchActionResponse struct {
+	Actions []Action `json:"actions"`
 }
 
 // EvaluationsSemantic controls short-circuit behaviour in batch evaluation.

@@ -23,6 +23,9 @@ type Decider interface {
 	EvaluateBatch(ctx context.Context, userInfo user.Info, action Action, resources []Resource) ([]bool, error)
 	// SearchResource answers: in which (cluster, namespace) scopes can userInfo perform action on resourceType?
 	SearchResource(ctx context.Context, userInfo user.Info, action Action, resourceType string) ([]Scope, error)
+	// SearchAction answers: what actions can userInfo perform on this specific resource?
+	// resource.Properties must include cluster, namespace, and apiGroup.
+	SearchAction(ctx context.Context, userInfo user.Info, resource Resource) ([]string, error)
 }
 
 // UserPermissionDecider implements Decider by reading from the UserPermission cache via Lister.
@@ -91,6 +94,44 @@ func (d *UserPermissionDecider) SearchResource(_ context.Context, userInfo user.
 		}
 	}
 	return deduplicateScopes(scopes), nil
+}
+
+func (d *UserPermissionDecider) SearchAction(_ context.Context, userInfo user.Info, resource Resource) ([]string, error) {
+	perms, err := d.lister.List(userInfo, labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+	cluster := resource.Properties["cluster"]
+	namespace := resource.Properties["namespace"]
+	apiGroup := resource.Properties["apiGroup"]
+
+	verbSet := make(map[string]struct{})
+	for i := range perms.Items {
+		perm := &perms.Items[i]
+		if !bindingCovers(perm.Status.Bindings, cluster, namespace) {
+			continue
+		}
+		for _, rule := range perm.Status.ClusterRoleDefinition.Rules {
+			if !coversResource(rule.Resources, resource.Type) || !coversAPIGroup(rule.APIGroups, apiGroup) {
+				continue
+			}
+			for _, verb := range rule.Verbs {
+				if verb == "*" {
+					for _, v := range []string{"get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"} {
+						verbSet[v] = struct{}{}
+					}
+				} else {
+					verbSet[verb] = struct{}{}
+				}
+			}
+		}
+	}
+
+	verbs := make([]string, 0, len(verbSet))
+	for v := range verbSet {
+		verbs = append(verbs, v)
+	}
+	return verbs, nil
 }
 
 // permAllows returns true if perm grants verb on (resourceType, apiGroup) within (cluster, namespace).

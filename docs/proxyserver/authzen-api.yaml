@@ -93,8 +93,8 @@ paths:
         Follows the AuthZen Authorization API 1.0 `/.well-known/authzen-configuration`
         discovery convention with spec-compliant field names and absolute HTTPS URLs.
 
-        `search_subject_endpoint` and `search_action_endpoint` are omitted because
-        those endpoints are not yet implemented.
+        `search_subject_endpoint` is omitted — `search/subject` (inverse query)
+        is explicitly deferred pending cache enumeration support.
       operationId: getAuthzenConfiguration
       responses:
         "200":
@@ -128,8 +128,8 @@ paths:
 
         **AuthZen spec deviation:** The AuthZen spec includes an optional `context`
         field (fourth element of SARC). It is not supported in this implementation.
-        The spec also allows `subject.properties` and `action.properties` extensibility
-        bags; these are not supported.
+        `action.properties` is also not supported. `subject.properties` IS supported
+        — see the `Subject` schema for the `groups` key used in cross-subject queries.
       operationId: evaluate
       requestBody:
         required: true
@@ -409,6 +409,94 @@ paths:
               schema:
                 type: string
 
+  /access/v1/search/action:
+    post:
+      summary: Action search (forward query)
+      description: |
+        Answers: **what actions can this subject perform on this specific resource?**
+
+        Returns the list of Kubernetes verbs the subject is permitted to execute on
+        the given resource type in the given cluster and namespace. An empty `actions`
+        list means the subject has no permissions on this resource.
+
+        All of `resource.properties.cluster`, `resource.properties.namespace`, and
+        `resource.properties.apiGroup` are required. `resource.id` is optional —
+        if omitted the question is "what can the subject do with any resource of
+        this type here?" rather than a specific named instance.
+
+        Wildcard verb grants (`"*"`) are expanded to the standard Kubernetes verbs:
+        `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`, `deletecollection`.
+      operationId: searchAction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchActionRequest"
+            examples:
+              what-can-alice-do-with-pods:
+                summary: What can alice do with pods in namespace default on cluster bar?
+                value:
+                  subject:
+                    type: user
+                    id: alice
+                  resource:
+                    type: pods
+                    properties:
+                      cluster: bar
+                      namespace: default
+                      apiGroup: ""
+      responses:
+        "200":
+          description: |
+            List of permitted actions. Empty list means no permissions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchActionResponse"
+              examples:
+                view-only:
+                  summary: Subject has view-only access
+                  value:
+                    actions:
+                      - name: get
+                      - name: list
+                      - name: watch
+                admin:
+                  summary: Subject has admin access
+                  value:
+                    actions:
+                      - name: get
+                      - name: list
+                      - name: watch
+                      - name: create
+                      - name: update
+                      - name: patch
+                      - name: delete
+                      - name: deletecollection
+                no-access:
+                  summary: Subject has no permissions here
+                  value:
+                    actions: []
+        "400":
+          description: Bad request — subject.id or resource.properties.cluster is missing
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          description: Unauthenticated
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          description: Caller may not query this subject
+          content:
+            text/plain:
+              schema:
+                type: string
+
 components:
   schemas:
 
@@ -488,14 +576,22 @@ components:
         type:
           type: string
           description: |
-            The plural Kubernetes resource name. For core API group resources
-            use the bare plural (e.g. `pods`, `configmaps`, `secrets`). For
-            non-core resources, use the bare plural — the `apiGroup` property
-            disambiguates the group (e.g. `type: deployments` with
-            `properties.apiGroup: apps`).
+            **Resource type taxonomy (Option A — frozen convention):**
+            `type` is the plural resource name ONLY — it never includes the API group.
+            `properties.apiGroup` carries the group separately. Together they
+            uniquely identify the Kubernetes resource:
+
+            | Resource | `type` | `properties.apiGroup` |
+            |----------|--------|-----------------------|
+            | pods (core) | `"pods"` | `""` |
+            | deployments | `"deployments"` | `"apps"` |
+            | VirtualMachines | `"virtualmachines"` | `"kubevirt.io"` |
+
+            This convention is frozen. Consumers must not embed the group in the
+            type string (e.g. `"virtualmachines.kubevirt.io"` is incorrect).
 
             For non-Kubernetes resources (metrics, observability data), use a
-            descriptive type string (e.g. `metric-series`). The PDP's resource
+            descriptive type string (e.g. `"metric-series"`). The PDP's resource
             model is type-agnostic.
         id:
           type: string
@@ -562,6 +658,29 @@ components:
             Note: `false` means no permission was found. It does not distinguish
             between "no permission exists" and "permission was explicitly denied".
             ACM's permission model is additive — there are no explicit deny rules.
+
+    SearchActionRequest:
+      type: object
+      required: [subject, resource]
+      properties:
+        subject:
+          $ref: "#/components/schemas/Subject"
+        resource:
+          $ref: "#/components/schemas/Resource"
+          description: |
+            `resource.properties.cluster`, `namespace`, and `apiGroup` are required.
+
+    SearchActionResponse:
+      type: object
+      required: [actions]
+      properties:
+        actions:
+          type: array
+          description: |
+            Permitted actions for the subject on this resource. Empty list means no
+            permissions. Wildcard grants are expanded — `"*"` never appears in the response.
+          items:
+            $ref: "#/components/schemas/Action"
 
     EvaluationsSemantic:
       type: string
@@ -693,8 +812,8 @@ components:
       description: |
         Discovery document for implemented AuthZen endpoints.
         Follows the AuthZen Authorization API 1.0 spec with absolute HTTPS URLs.
-        `search_subject_endpoint` and `search_action_endpoint` are omitted because
-        those endpoints are not yet implemented.
+        `search_subject_endpoint` is omitted — `search/subject` (inverse query)
+        is explicitly deferred pending cache enumeration support.
       required: [policy_decision_point, access_evaluation_endpoint]
       properties:
         policy_decision_point:

@@ -151,6 +151,7 @@ func installAuthZen(server *genericapiserver.GenericAPIServer, lister userpermis
 	server.Handler.NonGoRestfulMux.HandleFunc("/access/v1/evaluation", h.Evaluation)
 	server.Handler.NonGoRestfulMux.HandleFunc("/access/v1/evaluations", h.Evaluations)
 	server.Handler.NonGoRestfulMux.HandleFunc("/access/v1/search/resource", h.SearchResource)
+	server.Handler.NonGoRestfulMux.HandleFunc("/access/v1/search/action", h.SearchAction)
 }
 
 func installProxyGroup(proxyServiceInfoGetter *getter.ProxyServiceInfoGetter,

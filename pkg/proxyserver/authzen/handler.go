@@ -35,11 +35,14 @@ func (h *Handler) Discovery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	base := "https://" + r.Host
-	writeJSON(w, map[string]string{
-		"policy_decision_point":        base,
-		"access_evaluation_endpoint":   base + "/access/v1/evaluation",
-		"access_evaluations_endpoint":  base + "/access/v1/evaluations",
-		"search_resource_endpoint":     base + "/access/v1/search/resource",
+	writeJSON(w, map[string]interface{}{
+		"policy_decision_point":       base,
+		"access_evaluation_endpoint":  base + "/access/v1/evaluation",
+		"access_evaluations_endpoint": base + "/access/v1/evaluations",
+		"search_resource_endpoint":    base + "/access/v1/search/resource",
+		"search_action_endpoint":      base + "/access/v1/search/action",
+		"resource_type_convention":    "resource_name_only",
+		"resource_type_description":   "resource.type is the plural resource name (e.g. pods, deployments, virtualmachines). API group is carried in resource.properties.apiGroup.",
 	})
 }
 
@@ -169,6 +172,46 @@ func (h *Handler) SearchResource(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, resp)
+}
+
+// SearchAction serves POST /access/v1/search/action.
+func (h *Handler) SearchAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req SearchActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Subject.ID == "" {
+		http.Error(w, "subject.id is required", http.StatusBadRequest)
+		return
+	}
+	if req.Resource.Properties["cluster"] == "" {
+		http.Error(w, "resource.properties.cluster is required", http.StatusBadRequest)
+		return
+	}
+	callerInfo, ok := request.UserFrom(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !h.callerCanQuerySubject(r.Context(), callerInfo, req.Subject) {
+		http.Error(w, "forbidden: caller may only query their own permissions", http.StatusForbidden)
+		return
+	}
+	verbs, err := h.decider.SearchAction(r.Context(), subjectUserInfo(req.Subject, callerInfo), req.Resource)
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	actions := make([]Action, 0, len(verbs))
+	for _, v := range verbs {
+		actions = append(actions, Action{Name: v})
+	}
+	writeJSON(w, SearchActionResponse{Actions: actions})
 }
 
 // callerCanQuerySubject enforces authorization for cross-subject queries.

@@ -21,6 +21,7 @@ type mockDecider struct {
 	evaluateResult      bool
 	evaluateBatchResult []bool
 	searchResult        []Scope
+	searchActionResult  []string
 	err                 error
 }
 
@@ -32,6 +33,9 @@ func (m *mockDecider) EvaluateBatch(_ context.Context, _ user.Info, _ Action, _ 
 }
 func (m *mockDecider) SearchResource(_ context.Context, _ user.Info, _ Action, _ string) ([]Scope, error) {
 	return m.searchResult, m.err
+}
+func (m *mockDecider) SearchAction(_ context.Context, _ user.Info, _ Resource) ([]string, error) {
+	return m.searchActionResult, m.err
 }
 
 // requestWithUser injects a user.Info into the request context (simulates the auth middleware).
@@ -66,19 +70,26 @@ func TestDiscovery_ReturnsConfig(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	var resp map[string]string
+	var resp map[string]interface{}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
+	str := func(k string) string {
+		v, _ := resp[k].(string)
+		return v
+	}
 	base := "https://ocm-proxyserver.multicluster-engine.svc:443"
-	if resp["policy_decision_point"] != base {
-		t.Errorf("policy_decision_point: got %q want %q", resp["policy_decision_point"], base)
+	if str("policy_decision_point") != base {
+		t.Errorf("policy_decision_point: got %q want %q", str("policy_decision_point"), base)
 	}
-	if resp["access_evaluation_endpoint"] != base+"/access/v1/evaluation" {
-		t.Errorf("access_evaluation_endpoint: got %q", resp["access_evaluation_endpoint"])
+	if str("access_evaluation_endpoint") != base+"/access/v1/evaluation" {
+		t.Errorf("access_evaluation_endpoint: got %q", str("access_evaluation_endpoint"))
 	}
-	if resp["search_resource_endpoint"] != base+"/access/v1/search/resource" {
-		t.Errorf("search_resource_endpoint: got %q", resp["search_resource_endpoint"])
+	if str("search_resource_endpoint") != base+"/access/v1/search/resource" {
+		t.Errorf("search_resource_endpoint: got %q", str("search_resource_endpoint"))
+	}
+	if str("resource_type_convention") != "resource_name_only" {
+		t.Errorf("resource_type_convention missing or wrong: got %q", str("resource_type_convention"))
 	}
 }
 
@@ -350,6 +361,76 @@ func TestSearchResource_BadRequestOnMissingResourceType(t *testing.T) {
 	h.SearchResource(w, r)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// --- SearchAction ---
+
+func TestSearchAction_ReturnsVerbs(t *testing.T) {
+	h := NewHandler(&mockDecider{searchActionResult: []string{"get", "list", "watch"}}, nil)
+	body := SearchActionRequest{
+		Subject:  Subject{Type: "user", ID: "alice"},
+		Resource: Resource{Type: "pods", Properties: map[string]string{"cluster": "bar", "namespace": "default", "apiGroup": ""}},
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/search/action", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.SearchAction(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp SearchActionResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Actions) != 3 {
+		t.Errorf("expected 3 actions, got %d: %v", len(resp.Actions), resp.Actions)
+	}
+}
+
+func TestSearchAction_EmptyWhenNoAccess(t *testing.T) {
+	h := NewHandler(&mockDecider{searchActionResult: []string{}}, nil)
+	body := SearchActionRequest{
+		Subject:  Subject{Type: "user", ID: "alice"},
+		Resource: Resource{Type: "pods", Properties: map[string]string{"cluster": "no-cluster", "namespace": "default", "apiGroup": ""}},
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/search/action", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.SearchAction(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp SearchActionResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if len(resp.Actions) != 0 {
+		t.Errorf("expected empty actions, got %v", resp.Actions)
+	}
+}
+
+func TestSearchAction_BadRequestOnMissingCluster(t *testing.T) {
+	h := NewHandler(&mockDecider{}, nil)
+	body := SearchActionRequest{
+		Subject:  Subject{Type: "user", ID: "alice"},
+		Resource: Resource{Type: "pods"}, // no cluster
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/search/action", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.SearchAction(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestSearchAction_ForbiddenCrossSubject(t *testing.T) {
+	h := NewHandler(&mockDecider{}, nil)
+	body := SearchActionRequest{
+		Subject:  Subject{Type: "user", ID: "bob"},
+		Resource: Resource{Type: "pods", Properties: map[string]string{"cluster": "bar", "namespace": "default"}},
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/search/action", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.SearchAction(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
 	}
 }
 
