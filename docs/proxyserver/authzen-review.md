@@ -2,13 +2,13 @@
 
 | Field | Value |
 |---|---|
-| **Last reviewed** | 2026-08-18 16:04 PDT |
+| **Last reviewed** | 2026-08-18 16:38 PDT |
 | **Reviewer** | Joydeep Banerjee |
 | **Scope** | Phase 3 MVP — AuthZen endpoints in `ocm-proxyserver` |
 | **Parent DDR** | ACM-DDR-083 |
 | **Code reviewed** | `pkg/proxyserver/authzen/`, `pkg/proxyserver/api/register.go`, `cmd/proxyserver/app/server.go` |
 | **API spec reviewed** | `docs/proxyserver/authzen-api.yaml` |
-| **Status** | 2 items open before external review: #1 (resource type taxonomy — needs design decision) and #7 (search/action — ~2-3h implementation). Everything else done or explicitly deferred. |
+| **Status** | All pre-review items done. 1 minor finding this round (SearchAction verb order non-deterministic). Everything else done or explicitly deferred. Ready for external review. |
 
 ---
 
@@ -24,6 +24,17 @@ Code was read directly to confirm each claimed fix. Results:
 | #5 | Group resolution limitation documented | ✓ | Superseded by #9. F2 (stale description in `/evaluation` endpoint description) is now fixed. The `Action` schema correctly notes `action.properties` is not supported — accurate, stays as-is. |
 | #6 | `klog.Infof` → `klog.V(4).Infof` on SAR logs | ✓ | Both log lines downgraded. |
 | #9 | `subject.properties.groups` extension implemented | ✓ | `Subject.Properties`, `parseGroups`, and `subjectUserInfo` all verified. |
+| #1 | Resource type taxonomy — "resource name only" convention | ✓ | Documented in `types.go` comment with examples, encoded in discovery as `resource_type_convention: "resource_name_only"`, consistently applied across all tests. |
+| #7 | `search/action` endpoint | ✓ | Complete: types, `Decider` interface, `UserPermissionDecider.SearchAction`, handler, route registered in `register.go`, advertised in discovery, 4 decider tests + 4 handler tests. **New finding — see below.** |
+
+**New finding this round — `SearchAction` verb order is non-deterministic.**
+
+`SearchAction` collects verbs into a `map[string]struct{}` then iterates the map to build
+the response slice. Go map iteration order is randomised per run. The correct set of verbs
+is always returned, but in a different order on each call. Not a correctness issue — a
+consumer checking set membership is unaffected. A consumer diffing raw responses will see
+spurious differences. Tests should use set-based comparison, not slice order. Low priority
+but worth a one-line sort before returning.
 
 ---
 
@@ -34,8 +45,8 @@ correct: a decision service built on fragmented data would just centralize the
 inconsistency. Phase 3 as implemented is a solid POC. The Decider interface boundary is
 clean. The test coverage is good for a first pass.
 
-After the fixes in this round, one Must-priority item remains open (#1 — resource type
-taxonomy). All correctness and operational issues from the initial review are resolved.
+All Must-priority items are resolved. All pre-review blockers are closed. The one new
+finding (verb order) is low priority. This implementation is ready for external review.
 
 ---
 
@@ -240,13 +251,13 @@ consumers. *Deferred until `evaluation` and `search/resource` are proven in prod
 
 | # | Status | Priority | Action | Notes |
 |---|---|---|---|---|
-| 1 | **OPEN** | **Must** | Establish resource type taxonomy (`{resource}.{group}` convention); freeze in discovery and validate in handlers | Only Must still open. Needs a design decision. Breaking change if deferred past consumer integration. |
+| 1 | **DONE** | ~~Must~~ | Resource type taxonomy — "resource name only" convention | ✓ Documented in `types.go`, encoded in discovery response, consistently applied in tests. |
 | 2 | **DONE** | ~~Must~~ | Discovery — spec-compliant field names, absolute HTTPS URLs | ✓ F1 (field name mismatch) was already fixed in the YAML — reviewer was on an older version. |
 | 3 | **DONE** | ~~Must~~ | Batch `options.evaluations_semantic` short-circuit semantics | ✓ API contract is correct. Performance optimization (stopping evaluation early in the decider) is a separate concern folded into #8. |
 | 4 | **DONE** | ~~Must~~ | Fix `namespace == ""` false positive in `bindingCovers` | ✓ |
 | 5 | **DONE** | ~~Must~~ | Document group resolution limitation | ✓ Superseded by #9. F2 (stale endpoint description) now fixed. |
 | 6 | **DONE** | ~~Must~~ | `klog.Infof` → `klog.V(4).Infof` on SAR logs | ✓ |
-| 7 | **OPEN** | Argue for | `search/action` endpoint | ~2-3h implementation. 4/5 AuthZen endpoint types is a much stronger review position than 3/5. |
+| 7 | **DONE** | ~~Argue for~~ | `search/action` endpoint | ✓ Full implementation verified. **Minor:** verb results non-deterministic (map iteration) — add sort before returning. |
 | 8 | **DEFER** | Defer | `EvaluateBatch` full short-circuit in decider + O(P×R) optimization | Performance only — API semantics are correct. Revisit under real Search load. |
 | 9 | **DONE** | ~~Must~~ | `subject.properties.groups` for cross-subject group resolution | ✓ |
 | 10 | **DEFER** | Defer | Rate limiting on AuthZen paths | GenericAPIServer covers it; have the answer ready. |
