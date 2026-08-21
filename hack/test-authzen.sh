@@ -568,6 +568,41 @@ print(' '.join(sorted(clusters)))
     && pass "search/resources wildcard: local-cluster absent (alice has no access)" \
     || fail "search/resources wildcard: local-cluster should not appear" "clusters=$clusters_in_wildcard"
 
+  # --- include_binding_namespace_scopes flag ---
+  # bob has named namespace bindings (app-frontend, app-backend, openshift-monitoring)
+  # Without flag: no namespaces entry
+  [ -n "$BOB_TOKEN" ] && {
+    resp=$(authzen_post "$BOB_TOKEN" "/access/v1/search/resources" \
+      '{"subject":{"type":"user","id":"bob"},"action":{"name":"get"},"all_resource_types":true}')
+    has_ns=$(echo "$resp" | python3 -c "
+import json,sys
+results=json.load(sys.stdin).get('results',[])
+print('yes' if any(r.get('type')=='namespaces' for r in results) else 'no')
+" 2>/dev/null)
+    [ "$has_ns" = "no" ] \
+      && pass "search/resources: no namespaces entry without include_binding_namespace_scopes flag" \
+      || fail "search/resources: namespace entry should not appear without flag"
+
+    # With flag: namespaces entry must appear for bob's named namespaces
+    resp=$(authzen_post "$BOB_TOKEN" "/access/v1/search/resources" \
+      '{"subject":{"type":"user","id":"bob"},"action":{"name":"get"},"all_resource_types":true,"include_binding_namespace_scopes":true}')
+    has_ns=$(echo "$resp" | python3 -c "
+import json,sys
+results=json.load(sys.stdin).get('results',[])
+print('yes' if any(r.get('type')=='namespaces' for r in results) else 'no')
+" 2>/dev/null)
+    ns_scopes=$(echo "$resp" | python3 -c "
+import json,sys
+results=json.load(sys.stdin).get('results',[])
+for r in results:
+    if r.get('type')=='namespaces':
+        print(sorted([s['cluster']+'/'+s['namespace'] for s in r.get('scopes',[])]))
+" 2>/dev/null)
+    [ "$has_ns" = "yes" ] \
+      && pass "search/resources: namespaces entry appears with include_binding_namespace_scopes=true: $ns_scopes" \
+      || fail "search/resources: namespaces entry should appear with flag (OCP namespace visibility workaround)"
+  }
+
   # --- Bad request — neither mode set ---
   local code
   code=$(authzen_post_code "$ALICE_TOKEN" "/access/v1/search/resources" \

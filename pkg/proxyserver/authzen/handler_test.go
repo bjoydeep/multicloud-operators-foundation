@@ -38,7 +38,7 @@ func (m *mockDecider) SearchResource(_ context.Context, _ user.Info, _ Action, _
 func (m *mockDecider) SearchAction(_ context.Context, _ user.Info, _ Resource) ([]string, error) {
 	return m.searchActionResult, m.err
 }
-func (m *mockDecider) SearchResources(_ context.Context, _ user.Info, _ Action, _ []Resource, _ bool) ([]ResourceTypeScopes, error) {
+func (m *mockDecider) SearchResources(_ context.Context, _ user.Info, _ Action, _ []Resource, _ bool, _ bool) ([]ResourceTypeScopes, error) {
 	return m.searchResourcesResult, m.err
 }
 

@@ -309,7 +309,7 @@ func TestSearchResources_ExplicitList(t *testing.T) {
 		{Type: "pods", Properties: map[string]string{"apiGroup": ""}},
 		{Type: "deployments", Properties: map[string]string{"apiGroup": "apps"}},
 	}
-	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, resources, false)
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, resources, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +332,7 @@ func TestSearchResources_ExplicitList_ApiGroupPrecision(t *testing.T) {
 		{Type: "virtualmachines", Properties: map[string]string{"apiGroup": "kubevirt.io"}}, // has access
 		{Type: "pods", Properties: map[string]string{"apiGroup": "kubevirt.io"}},            // no access — pods not in kubevirt.io
 	}
-	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, resources, false)
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, resources, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +350,7 @@ func TestSearchResources_WildcardMode_AdminEmitsWildcardEntries(t *testing.T) {
 	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
 		Items: []clusterviewv1alpha1.UserPermission{adminPermission("bar")},
 	}})
-	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true)
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func TestSearchResources_WildcardMode_SpecificRulesEmitSpecificTypes(t *testing.
 	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
 		Items: []clusterviewv1alpha1.UserPermission{namespacedPermission("bar", []string{"alpha"}, rules)},
 	}})
-	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true)
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,13 +391,75 @@ func TestSearchResources_WildcardMode_SpecificRulesEmitSpecificTypes(t *testing.
 	}
 }
 
+func TestSearchResources_IncludeBindingNamespaceScopes(t *testing.T) {
+	// User has kubevirt MCRA on namespace "alpha" — no namespaces rule.
+	// include_binding_namespace_scopes should emit namespaces/"" for "alpha" from the binding.
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"kubevirt.io"}, Resources: []string{"virtualmachines"}, Verbs: []string{"get"}},
+	}
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{namespacedPermission("bar", []string{"alpha"}, rules)},
+	}})
+
+	// Without flag: no namespaces entry
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range results {
+		if r.Type == "namespaces" {
+			t.Errorf("expected no namespaces entry without flag, got: %+v", r)
+		}
+	}
+
+	// With flag: namespaces entry emitted from binding
+	results, err = d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range results {
+		if r.Type == "namespaces" && r.APIGroup == "" {
+			found = true
+			if len(r.Scopes) != 1 || r.Scopes[0].Cluster != "bar" || r.Scopes[0].Namespace != "alpha" {
+				t.Errorf("unexpected namespace scopes: %+v", r.Scopes)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected namespaces entry with flag, got: %+v", results)
+	}
+}
+
+func TestSearchResources_IncludeBindingNamespaceScopes_ClusterWideBindingExcluded(t *testing.T) {
+	// Cluster-wide binding (namespace="*") should NOT generate a Namespace scope —
+	// there's no specific namespace to list.
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{adminPermission("bar")}, // namespace="*"
+	}})
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range results {
+		if r.Type == "namespaces" && r.APIGroup == "" {
+			// Should not have specific namespace scopes from cluster-wide binding
+			for _, s := range r.Scopes {
+				if s.Namespace == "*" {
+					t.Errorf("cluster-wide binding should not emit namespace scopes, got: %+v", s)
+				}
+			}
+		}
+	}
+}
+
 func TestSearchResources_WildcardMode_VerbFiltered(t *testing.T) {
 	// view permission — get/list/watch only
 	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
 		Items: []clusterviewv1alpha1.UserPermission{viewPermission("bar")},
 	}})
 	// asking for "create" — view doesn't grant it, so no results
-	results, err := d.SearchResources(ctx, alice, Action{Name: "create"}, nil, true)
+	results, err := d.SearchResources(ctx, alice, Action{Name: "create"}, nil, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}

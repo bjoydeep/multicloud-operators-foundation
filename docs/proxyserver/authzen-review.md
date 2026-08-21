@@ -8,7 +8,7 @@
 | **Parent DDR** | ACM-DDR-083 |
 | **Code reviewed** | `pkg/proxyserver/authzen/`, `pkg/proxyserver/api/register.go`, `cmd/proxyserver/app/server.go` |
 | **API spec reviewed** | `docs/proxyserver/authzen-api.yaml` |
-| **Status** | All pre-review items done. 1 minor finding this round (SearchAction verb order non-deterministic). Everything else done or explicitly deferred. Ready for external review. |
+| **Status** | All items resolved. Verb sort finding fixed. 3 production adoption concerns documented (RBAC rollout — easy; network dependency — needs debate; Go client — easy). Ready for external review. |
 
 ---
 
@@ -27,14 +27,15 @@ Code was read directly to confirm each claimed fix. Results:
 | #1 | Resource type taxonomy — "resource name only" convention | ✓ | Documented in `types.go` comment with examples, encoded in discovery as `resource_type_convention: "resource_name_only"`, consistently applied across all tests. |
 | #7 | `search/action` endpoint | ✓ | Complete: types, `Decider` interface, `UserPermissionDecider.SearchAction`, handler, route registered in `register.go`, advertised in discovery, 4 decider tests + 4 handler tests. **New finding — see below.** |
 
-**New finding this round — `SearchAction` verb order is non-deterministic.**
+**New finding this round — `SearchAction` verb order is non-deterministic. FIXED.**
 
-`SearchAction` collects verbs into a `map[string]struct{}` then iterates the map to build
-the response slice. Go map iteration order is randomised per run. The correct set of verbs
-is always returned, but in a different order on each call. Not a correctness issue — a
-consumer checking set membership is unaffected. A consumer diffing raw responses will see
-spurious differences. Tests should use set-based comparison, not slice order. Low priority
-but worth a one-line sort before returning.
+`SearchAction` collected verbs into a `map[string]struct{}` then iterated the map to build
+the response slice. Go map iteration order is randomised per run. Not a correctness issue
+but a consumer diffing raw responses would see spurious differences.
+
+**Fixed:** `sort.Strings(verbs)` added before return in `decider.go`. Same fix applied to
+`SearchResources` — both `ResourceTypeScopes` results and `ScopeEntry` slices within each
+result are now sorted deterministically (type/apiGroup asc, cluster/namespace asc).
 
 ---
 
@@ -286,6 +287,208 @@ Specific answers to prepare:
 | "You're missing `search/subject`" | "Explicitly deferred. The cache has no public enumeration method today; adding it safely is the sequencing constraint." |
 | "Cross-subject queries lose group permissions" | "Addressed via `subject.properties.groups` — callers pass the subject's groups alongside their name. Callers hold the user's bearer token and resolve groups via a single `TokenReview`. This is spec-compliant use of AuthZen's `subject.properties` extensibility." |
 | "AuthZen is a new and immature standard" | "Correct. We align with it for its type-agnostic resource model, built-in batch semantics, and standards trajectory — not because it fully solves the multicluster problem today. Where it falls short, we have documented ACM-specific adaptations." |
+
+---
+
+## Strategic Argument for Migration
+
+Consumer reviews (search-v2-api, search-mcp-server) raise valid concerns about migration
+effort. There are two ways to read those concerns.
+
+**Reviewer frame:** "Can I swap AuthZen in today without breaking search?"
+Answer: Partially — with a non-trivial rewrite.
+
+**Architecture frame:** "Can AuthZen become the stable contract layer so the backend
+can change freely?"
+Answer: Yes — and that is the entire point.
+
+### The cost of NOT migrating
+
+Right now every consumer reads the raw `UserPermission` CRD format directly. They all
+have code that walks `ClusterBinding`, `ClusterRoleDefinition`, and `PolicyRule`. When
+Phase 1 adds auto-MCRA, or Phase 2 adds hub permissions, or the cache changes shape —
+every consumer must be updated simultaneously.
+
+```
+Before (today):
+  search-v2-api      ──reads──▶ UserPermission CRD internals
+  search-mcp-server  ──reads──▶ UserPermission CRD internals
+  console            ──reads──▶ UserPermission CRD internals
+
+After (AuthZen as contract layer):
+  search-v2-api      ──calls──▶ AuthZen API ──▶ backend (changes freely)
+  search-mcp-server  ──calls──▶ AuthZen API ──▶ backend (changes freely)
+  console            ──calls──▶ AuthZen API ──▶ backend (changes freely)
+```
+
+Once consumers are behind the AuthZen contract, the backend is free to evolve. The entire
+`userpermission.Cache` can be replaced — new MCRA pipeline, hub permissions, different
+informer structure — and no consumer changes. The AuthZen server absorbs the change.
+This is not philosophical. It is operational leverage.
+
+### The migration cost is one-time
+
+The reviewers treat the search-v2-api rewrite as a reason not to migrate. The correct
+frame is that it is a necessary one-time cost to reach a better architecture. The rewrite
+happens once. The decoupling benefit is permanent. After migration, search-v2-api never
+touches `ClusterBinding` or `PolicyRule` again — it calls an API and gets structured
+scope lists.
+
+### What this means for open gaps
+
+The functional gaps the reviews identify (`matchNamespaces()` implicit visibility, SQL
+shape, transport) are real engineering problems. They are not arguments against migration
+— they are the scope of the migration. They should be solved as part of the adoption
+work, not used as reasons to defer it indefinitely.
+
+---
+
+## Production Adoption Concerns
+
+Three architectural concerns raised during consumer review.
+Classified by effort and priority.
+
+### Point 1 — New mandatory RBAC rollout (Easy, operational, not MVP)
+
+The `ocm-proxyserver`'s `DelegatingAuthorizationOptions` enforces authorization on all
+paths including non-resource URLs like `/access/v1/*`. Every caller needs a `ClusterRole`
+with `nonResourceURLs: ["/access/v1/..."] verbs: ["get","post"]` bound to them.
+
+This doesn't exist in ACM's out-of-box RBAC today. Adoption requires:
+- For self-queries by end users: bind a minimal `ClusterRole` to `system:authenticated`
+- For elevated callers (Search SA, MCP SA): explicit `impersonate` grant in addition. These already exist.
+
+**Classification:** Easy operational/packaging work. Standard RBAC rollout, no design
+changes required. Not an MVP blocker — handled as part of the feature's adoption rollout.
+
+---
+
+### Point 2 — New network dependency (Architectural — needs peer review and debate)
+
+The AuthZen endpoints are served by `ocm-proxyserver` on its `NonGoRestfulMux`
+(`/access/v1/...` paths), **not** proxied through the standard Kubernetes aggregated
+API server path (`/apis/<group>/<version>/...`). Today, all in-cluster consumers make
+one connection to `kubernetes.default.svc` (the kube-apiserver) and get everything —
+including `userpermissions` via aggregation.
+
+If a consumer adopts the AuthZen endpoints, it needs a **second, separate connection**:
+
+```
+Today:
+  consumer ──▶ kubernetes.default.svc (one front door, one TLS cert, one badge check)
+               │
+               └── /apis/clusterview.../userpermissions → routes to ocm-proxyserver
+
+With AuthZen:
+  consumer ──▶ kubernetes.default.svc               (still needed for everything else)
+  consumer ──▶ ocm-proxyserver.multicluster-engine.svc:443  (NEW — different door)
+               └── /access/v1/...
+```
+
+The second connection requires:
+- New endpoint configuration (service address, port)
+- Different TLS trust — `ocm-proxyserver` has its own cert, not the kube-apiserver CA
+- Possible NetworkPolicy changes to allow the new traffic path
+- New service dependency in consumer deployment manifests
+
+**Root cause:** AuthZen spec mandates `/access/v1/...` paths, which Kubernetes
+aggregation only routes for `/apis/...` paths. There is a real tension: spec compliance
+requires these paths, but Kubernetes's aggregation infrastructure only forwards `/apis/`.
+
+**Potential mitigation (not implemented):** Register a Kubernetes APIService at
+`/apis/authzen.open-cluster-management.io/v1/` that proxies to `ocm-proxyserver` and
+translates paths. This would restore the single-connection model but is complex and
+would break AuthZen path compliance for external clients.
+
+**Classification:** Hard architectural concern. Requires peer review and debate before
+any existing in-cluster consumer (search-mcp-server, search-v2-api) adopts the API.
+New consumers designed specifically for AuthZen are not affected — they expect to call
+a separate endpoint.
+
+---
+
+### Point 4 — Namespace visibility: OCP constraint, not an AuthZen gap (Implement in AuthZen)
+
+**The OCP constraint:**
+
+In OpenShift, namespace visibility is "all or none" at the RBAC level. You can either
+list ALL namespaces (cluster-admin) or NONE. Standard Kubernetes RBAC provides no way
+to say "show only the namespaces where this user has some access." This is an OCP
+platform limitation.
+
+Confirmed by search-v2-api team: *"Yes, that's important. It comes from the fact that in
+OCP for the Namespace object you can only authorize a user to see all or none. We have
+several cases where the user needs to see only the namespaces they are authorized for, so
+this logic is taking care of that."*
+
+Standard Kubernetes RBAC:
+```bash
+kubectl get pods -n foo          # ✅ works — you have the rule
+kubectl get namespace foo        # ❌ fails — namespaces is separate, no rule granted
+kubectl get namespaces           # ❌ fails — all or none in OCP
+```
+
+**What `matchNamespaces()` does:**
+
+search-v2-api works around the OCP constraint with `matchNamespaces()`
+(`rbacFineGrainedHelper.go:162-206`): if a user has **any binding** on a cluster, grant
+them visibility of the `Namespace` object for any namespace in that binding, regardless
+of whether any RBAC rule covers `namespaces`. This is binding-driven, not rule-driven.
+
+**AuthZen is correct — but the OCP workaround must live somewhere:**
+
+`search/resources` is strictly rule-gated and correctly mirrors Kubernetes RBAC. It does
+NOT include the OCP namespace workaround — which is right. AuthZen should not invent
+permissions that don't exist in RBAC.
+
+However, the OCP workaround is legitimate and every consumer will need it. If it stays
+in search-v2-api only, console, observability, and MCP server will all reimplement it
+independently. This is exactly the duplication the AuthZen contract layer is designed
+to prevent.
+
+**The right fix: implement once in AuthZen, all consumers benefit.**
+
+Add `include_binding_namespace_scopes` flag to `search/resources`. When set, the server
+walks `Status.Bindings` directly and emits `Namespace` scopes for any bound
+cluster/namespace, regardless of rules:
+
+```json
+{
+  "subject": { "type": "user", "id": "alice" },
+  "action":  { "name": "get" },
+  "all_resource_types": true,
+  "include_binding_namespace_scopes": true
+}
+```
+
+Response includes additional namespace entries:
+```json
+{ "type": "namespaces", "api_group": "", "scopes": [{"cluster": "bar", "namespace": "alpha"}] }
+```
+
+**Implemented** — see `SearchResourcesRequest.IncludeBindingNamespaceScopes` in
+`pkg/proxyserver/authzen/types.go` and `decider.go`.
+
+**Classification:** ACM/OCP-specific extension. Not part of the AuthZen spec. Documented
+in `authzen-api.yaml`. Justified by the OCP platform constraint and the value of
+centralising the workaround rather than duplicating it across every consumer.
+
+---
+
+### Point 3 — No official Go client (Easy, not MVP)
+
+Only server-side code exists (`pkg/proxyserver/authzen/{decider,handler,types}.go`).
+Consumers would need to hand-roll `net/http` + JSON clients. Additionally, error
+responses currently use `http.Error()` returning `text/plain` bodies — not the
+structured `Status` JSON objects that `client-go` and other Kubernetes tooling expect.
+
+**What is needed:**
+- `pkg/client/authzen/` — typed Go client with methods for each endpoint
+- Replace `http.Error()` with structured JSON `Status` error responses
+
+**Classification:** Easy, straightforward engineering work. Not an MVP blocker but
+required before any Go-based consumer integrates. A typed client removes adoption
+friction significantly.
 
 ---
 

@@ -115,11 +115,20 @@ type ResourceTypeScopes struct {
 // Two modes — set exactly one:
 //   - Resources: explicit list of (type, apiGroup) pairs to check
 //   - AllResourceTypes: wildcard — return scopes for everything the subject can access
+//
+// ACM/OCP extension — IncludeBindingNamespaceScopes:
+// In OpenShift, namespace visibility is "all or none" at the RBAC level — there is no
+// native way to list only the namespaces a user has partial access to. This flag adds
+// Namespace entries for every (cluster, namespace) pair in the subject's bindings,
+// regardless of whether any RBAC rule explicitly grants access to the namespaces resource.
+// Equivalent to search-v2-api's matchNamespaces() OCP workaround, centralised here so
+// every consumer benefits without reimplementing it.
 type SearchResourcesRequest struct {
-	Subject          Subject    `json:"subject"`
-	Action           Action     `json:"action"`
-	Resources        []Resource `json:"resources,omitempty"`
-	AllResourceTypes bool       `json:"all_resource_types,omitempty"`
+	Subject                      Subject    `json:"subject"`
+	Action                       Action     `json:"action"`
+	Resources                    []Resource `json:"resources,omitempty"`
+	AllResourceTypes             bool       `json:"all_resource_types,omitempty"`
+	IncludeBindingNamespaceScopes bool      `json:"include_binding_namespace_scopes,omitempty"`
 }
 
 // SearchResourcesResponse is returned by the search/resources endpoint.

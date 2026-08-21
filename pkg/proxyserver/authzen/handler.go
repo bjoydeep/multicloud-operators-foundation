@@ -207,7 +207,7 @@ func (h *Handler) SearchResources(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden: caller may only query their own permissions", http.StatusForbidden)
 		return
 	}
-	results, err := h.decider.SearchResources(r.Context(), subjectUserInfo(req.Subject, callerInfo), req.Action, req.Resources, req.AllResourceTypes)
+	results, err := h.decider.SearchResources(r.Context(), subjectUserInfo(req.Subject, callerInfo), req.Action, req.Resources, req.AllResourceTypes, req.IncludeBindingNamespaceScopes)
 	if err != nil {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 		return

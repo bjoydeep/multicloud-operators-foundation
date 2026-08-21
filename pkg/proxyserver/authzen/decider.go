@@ -31,7 +31,9 @@ type Decider interface {
 	//   - Explicit list: resources contains specific (type, apiGroup) pairs to check.
 	//   - Wildcard (allTypes=true): returns all (type, apiGroup) → scopes the user has,
 	//     emitting type="*" / apiGroup="*" entries for wildcard rule grants.
-	SearchResources(ctx context.Context, userInfo user.Info, action Action, resources []Resource, allTypes bool) ([]ResourceTypeScopes, error)
+	// includeBindingNamespaceScopes adds Namespace entries for every bound (cluster, namespace)
+	// regardless of rules — implements the OCP namespace visibility workaround.
+	SearchResources(ctx context.Context, userInfo user.Info, action Action, resources []Resource, allTypes bool, includeBindingNamespaceScopes bool) ([]ResourceTypeScopes, error)
 }
 
 // UserPermissionDecider implements Decider by reading from the UserPermission cache via Lister.
@@ -102,7 +104,7 @@ func (d *UserPermissionDecider) SearchResource(_ context.Context, userInfo user.
 	return deduplicateScopes(scopes), nil
 }
 
-func (d *UserPermissionDecider) SearchResources(_ context.Context, userInfo user.Info, action Action, resources []Resource, allTypes bool) ([]ResourceTypeScopes, error) {
+func (d *UserPermissionDecider) SearchResources(_ context.Context, userInfo user.Info, action Action, resources []Resource, allTypes bool, includeBindingNamespaceScopes bool) ([]ResourceTypeScopes, error) {
 	perms, err := d.lister.List(userInfo, labels.Everything())
 	if err != nil {
 		return nil, err
@@ -144,6 +146,27 @@ func (d *UserPermissionDecider) SearchResources(_ context.Context, userInfo user
 								addScope(resKey{req.Type, reqAPIGroup}, binding.Cluster, ns)
 							}
 						}
+					}
+				}
+			}
+		}
+	}
+
+	// OCP namespace visibility workaround: in OpenShift, namespaces are "all or none"
+	// at the RBAC level — no native way to list only namespaces a user has partial access to.
+	// When requested, emit Namespace scopes for every bound (cluster, namespace) regardless
+	// of whether any rule explicitly covers the namespaces resource.
+	if includeBindingNamespaceScopes {
+		nsKey := resKey{"namespaces", ""}
+		if scopeMap[nsKey] == nil {
+			scopeMap[nsKey] = map[string]ScopeEntry{}
+		}
+		for i := range perms.Items {
+			for _, binding := range perms.Items[i].Status.Bindings {
+				for _, ns := range binding.Namespaces {
+					if ns != "*" { // only named namespaces — cluster-wide bindings don't imply a specific ns
+						id := binding.Cluster + "/" + ns
+						scopeMap[nsKey][id] = ScopeEntry{Cluster: binding.Cluster, Namespace: ns}
 					}
 				}
 			}
