@@ -96,6 +96,7 @@ rules:
   - "/access/v1/evaluations"
   - "/access/v1/search/resource"
   - "/access/v1/search/action"
+  - "/access/v1/search/resources"
   - "/.well-known/authzen-configuration"
   verbs: ["get", "post"]
 EOF
@@ -354,6 +355,7 @@ rules:
   - "/access/v1/evaluations"
   - "/access/v1/search/resource"
   - "/access/v1/search/action"
+  - "/access/v1/search/resources"
   - "/.well-known/authzen-configuration"
   verbs: ["get", "post"]
 EOF

@@ -3,6 +3,7 @@ package authzen
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	clusterviewv1alpha1 "github.com/stolostron/cluster-lifecycle-api/clusterview/v1alpha1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -26,6 +27,11 @@ type Decider interface {
 	// SearchAction answers: what actions can userInfo perform on this specific resource?
 	// resource.Properties must include cluster, namespace, and apiGroup.
 	SearchAction(ctx context.Context, userInfo user.Info, resource Resource) ([]string, error)
+	// SearchResources is a bulk version of SearchResource supporting two modes:
+	//   - Explicit list: resources contains specific (type, apiGroup) pairs to check.
+	//   - Wildcard (allTypes=true): returns all (type, apiGroup) → scopes the user has,
+	//     emitting type="*" / apiGroup="*" entries for wildcard rule grants.
+	SearchResources(ctx context.Context, userInfo user.Info, action Action, resources []Resource, allTypes bool) ([]ResourceTypeScopes, error)
 }
 
 // UserPermissionDecider implements Decider by reading from the UserPermission cache via Lister.
@@ -96,6 +102,83 @@ func (d *UserPermissionDecider) SearchResource(_ context.Context, userInfo user.
 	return deduplicateScopes(scopes), nil
 }
 
+func (d *UserPermissionDecider) SearchResources(_ context.Context, userInfo user.Info, action Action, resources []Resource, allTypes bool) ([]ResourceTypeScopes, error) {
+	perms, err := d.lister.List(userInfo, labels.Everything())
+	if err != nil {
+		return nil, err
+	}
+
+	// resKey → scopeKey → ScopeEntry (deduplicated)
+	type resKey struct{ typ, apiGroup string }
+	scopeMap := map[resKey]map[string]ScopeEntry{}
+
+	addScope := func(k resKey, cluster, namespace string) {
+		if scopeMap[k] == nil {
+			scopeMap[k] = map[string]ScopeEntry{}
+		}
+		id := cluster + "/" + namespace
+		scopeMap[k][id] = ScopeEntry{Cluster: cluster, Namespace: namespace}
+	}
+
+	for i := range perms.Items {
+		perm := &perms.Items[i]
+		for _, binding := range perm.Status.Bindings {
+			for _, ns := range binding.Namespaces {
+				for _, rule := range perm.Status.ClusterRoleDefinition.Rules {
+					if !coversVerb(rule.Verbs, action.Name) {
+						continue
+					}
+					if allTypes {
+						// Wildcard mode: emit rules as-is — "*" stays as "*"
+						for _, res := range rule.Resources {
+							for _, ag := range rule.APIGroups {
+								addScope(resKey{res, ag}, binding.Cluster, ns)
+							}
+						}
+					} else {
+						// Explicit list mode: match only caller-requested types
+						for _, req := range resources {
+							reqAPIGroup := req.Properties["apiGroup"]
+							if coversResource(rule.Resources, req.Type) &&
+								coversAPIGroup(rule.APIGroups, reqAPIGroup) {
+								addScope(resKey{req.Type, reqAPIGroup}, binding.Cluster, ns)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	results := make([]ResourceTypeScopes, 0, len(scopeMap))
+	for k, scopes := range scopeMap {
+		scopeList := make([]ScopeEntry, 0, len(scopes))
+		for _, s := range scopes {
+			scopeList = append(scopeList, s)
+		}
+		// Sort scopes deterministically: cluster asc, namespace asc
+		sort.Slice(scopeList, func(i, j int) bool {
+			if scopeList[i].Cluster != scopeList[j].Cluster {
+				return scopeList[i].Cluster < scopeList[j].Cluster
+			}
+			return scopeList[i].Namespace < scopeList[j].Namespace
+		})
+		results = append(results, ResourceTypeScopes{
+			Type:     k.typ,
+			APIGroup: k.apiGroup,
+			Scopes:   scopeList,
+		})
+	}
+	// Sort results deterministically: type asc, api_group asc
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Type != results[j].Type {
+			return results[i].Type < results[j].Type
+		}
+		return results[i].APIGroup < results[j].APIGroup
+	})
+	return results, nil
+}
+
 func (d *UserPermissionDecider) SearchAction(_ context.Context, userInfo user.Info, resource Resource) ([]string, error) {
 	perms, err := d.lister.List(userInfo, labels.Everything())
 	if err != nil {
@@ -131,6 +214,7 @@ func (d *UserPermissionDecider) SearchAction(_ context.Context, userInfo user.In
 	for v := range verbSet {
 		verbs = append(verbs, v)
 	}
+	sort.Strings(verbs)
 	return verbs, nil
 }
 

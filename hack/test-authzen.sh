@@ -504,6 +504,92 @@ suite_search_action() {
     || fail "search/action: bob view expected get=True create=False, got get=$has_get create=$has_create"
 }
 
+suite_search_resources() {
+  bold "=== Suite: search/resources — bulk + wildcard ==="
+  [ -z "$ALICE_TOKEN" ] && skip "search/resources tests (alice not set up)" && return
+
+  local resp cnt
+
+  # --- Explicit list mode ---
+  # alice has admin on dsf-mc and view on dsf-mc-02 — both should appear for pods
+  resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/search/resources" \
+    '{"subject":{"type":"user","id":"alice"},"action":{"name":"get"},
+"resources":[
+  {"type":"pods","properties":{"apiGroup":""}},
+  {"type":"deployments","properties":{"apiGroup":"apps"}}
+]}')
+  cnt=$(echo "$resp" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('results',[])))" 2>/dev/null)
+  [ "$cnt" = "2" ] \
+    && pass "search/resources explicit: 2 types returned (pods, deployments)" \
+    || fail "search/resources explicit: expected 2 results, got $cnt — resp=$resp"
+
+  # apiGroup precision — bob has acm-test:workload-admin (apiGroups: ["","apps","batch"])
+  # asking for pods.kubevirt.io should return empty (bob has no kubevirt.io access)
+  # Note: alice (admin/wildcard) would match anything — wrong subject for this check
+  [ -n "$BOB_TOKEN" ] && {
+    resp=$(authzen_post "$BOB_TOKEN" "/access/v1/search/resources" \
+      '{"subject":{"type":"user","id":"bob"},"action":{"name":"get"},
+"resources":[
+  {"type":"pods","properties":{"apiGroup":"kubevirt.io"}}
+]}')
+    cnt=$(echo "$resp" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('results',[])))" 2>/dev/null)
+    [ "$cnt" = "0" ] \
+      && pass "search/resources explicit: apiGroup precision — bob has no kubevirt.io access, returns empty" \
+      || fail "search/resources explicit: apiGroup precision failed, got $cnt results (bob should not match kubevirt.io)"
+  }
+
+  # --- Wildcard mode ---
+  resp=$(authzen_post "$ALICE_TOKEN" "/access/v1/search/resources" \
+    '{"subject":{"type":"user","id":"alice"},"action":{"name":"get"},"all_resource_types":true}')
+  # alice has managedcluster:admin (resources:["*"]) on dsf-mc and managedcluster:view on dsf-mc-02
+  # wildcard mode should emit type="*" entries
+  local has_wildcard
+  has_wildcard=$(echo "$resp" | python3 -c "
+import json,sys
+results=json.load(sys.stdin).get('results',[])
+print('yes' if any(r.get('type')=='*' for r in results) else 'no')
+" 2>/dev/null)
+  [ "$has_wildcard" = "yes" ] \
+    && pass "search/resources wildcard: type='*' entries present for admin grants" \
+    || fail "search/resources wildcard: expected type='*' entries for alice's admin grant" "resp=$resp"
+
+  # wildcard mode — no access on local-cluster means no local-cluster scopes under type="*"
+  local clusters_in_wildcard
+  clusters_in_wildcard=$(echo "$resp" | python3 -c "
+import json,sys
+results=json.load(sys.stdin).get('results',[])
+clusters=set()
+for r in results:
+    for s in r.get('scopes',[]):
+        clusters.add(s.get('cluster',''))
+print(' '.join(sorted(clusters)))
+" 2>/dev/null)
+  [[ "$clusters_in_wildcard" != *"local-cluster"* ]] \
+    && pass "search/resources wildcard: local-cluster absent (alice has no access)" \
+    || fail "search/resources wildcard: local-cluster should not appear" "clusters=$clusters_in_wildcard"
+
+  # --- Bad request — neither mode set ---
+  local code
+  code=$(authzen_post_code "$ALICE_TOKEN" "/access/v1/search/resources" \
+    '{"subject":{"type":"user","id":"alice"},"action":{"name":"get"}}')
+  assert_http "search/resources: 400 when neither mode set" "$code" "400"
+
+  # --- Bob wildcard mode — MCRA grants should appear as specific types ---
+  [ -z "$BOB_TOKEN" ] && return
+  resp=$(authzen_post "$BOB_TOKEN" "/access/v1/search/resources" \
+    '{"subject":{"type":"user","id":"bob"},"action":{"name":"get"},"all_resource_types":true}')
+  # bob has acm-test:workload-admin (pods/deployments/etc, NOT wildcard resources)
+  # so results should be specific types, NOT type="*"
+  has_wildcard=$(echo "$resp" | python3 -c "
+import json,sys
+results=json.load(sys.stdin).get('results',[])
+print('yes' if any(r.get('type')=='*' for r in results) else 'no')
+" 2>/dev/null)
+  [ "$has_wildcard" = "no" ] \
+    && pass "search/resources wildcard: bob MCRA returns specific types (not wildcard)" \
+    || fail "search/resources wildcard: bob MCRA should not emit type='*'" "resp=$resp"
+}
+
 suite_namespace_security() {
   # Tests the namespace=="" fix: omitting namespace must not grant access.
   # bob has namespace-scoped MCRA access (app-frontend, app-backend on dsf-mc) — ideal test subject.
@@ -659,6 +745,8 @@ echo ""
 suite_carol
 echo ""
 suite_namespace_security
+echo ""
+suite_search_resources
 echo ""
 suite_search_action
 echo ""

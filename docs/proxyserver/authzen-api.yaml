@@ -19,7 +19,39 @@ info:
     `GET /apis/clusterview.open-cluster-management.io/v1alpha1/userpermissions`.
     No new data stores or controllers are required.
 
-    ## AuthZen conformance notes
+    ## Endpoint classification
+
+    This API has two distinct layers. Callers should understand which layer an endpoint
+    belongs to before assuming interoperability with other AuthZen implementations.
+
+    **Layer 1 — AuthZen Authorization API 1.0 endpoints (spec-defined):**
+
+    | Endpoint | AuthZen spec section |
+    |----------|---------------------|
+    | `GET /.well-known/authzen-configuration` | §7 Discovery |
+    | `POST /access/v1/evaluation` | §5.1 Access Evaluation |
+    | `POST /access/v1/evaluations` | §5.2 Access Evaluations |
+    | `POST /access/v1/search/resource` | §6.2 Resource Search |
+    | `POST /access/v1/search/action` | §6.3 Action Search |
+
+    These implement a **multicluster profile** of the AuthZen spec. Where ACM deviates
+    from the spec (e.g. `search/resource` returning scopes not instances, single action
+    for batch, `subject.properties.groups` extension), the deviation is intentional and
+    documented on each endpoint.
+
+    **Layer 2 — ACM extensions OVER AND ABOVE the AuthZen spec:**
+
+    | Endpoint | Purpose |
+    |----------|---------|
+    | `POST /access/v1/search/resources` | Bulk resource scope query (not in AuthZen spec) |
+
+    `/access/v1/search/resources` addresses a gap in the AuthZen spec for consumers
+    (Search, MCP server) that need the user's full permission surface across multiple
+    resource types in a single call. The AuthZen spec has no equivalent — it only
+    supports one resource type at a time via `search/resource`. This endpoint is
+    ACM-specific and should not be expected to exist on other AuthZen implementations.
+
+    ## AuthZen spec conformance summary
 
     This API implements a **multicluster profile** of AuthZen Authorization API 1.0.
     The deviations and extensions reflect the requirements of any AuthZen implementation
@@ -497,6 +529,165 @@ paths:
               schema:
                 type: string
 
+  /access/v1/search/resources:
+    post:
+      summary: Bulk resource scope query (ACM extension — not in AuthZen spec)
+      description: |
+        **ACM-specific extension over and above the AuthZen spec.**
+
+        Answers: **across which (cluster, namespace) scopes can this subject access
+        these resource types?** — for multiple resource types in a single call.
+
+        This endpoint exists because the AuthZen spec only supports one resource type
+        at a time via `POST /access/v1/search/resource`. Consumers such as Search and
+        MCP Server need the user's full permission surface across all resource types in
+        one shot to build a SQL WHERE clause without O(N) HTTP round trips.
+
+        ## Two modes
+
+        **Explicit list mode** — set `resources` with the types you want to check.
+        The server returns scopes for each named (type, apiGroup) pair. apiGroup
+        precision is preserved: `pods` in core and `pods` in `kubevirt.io` (hypothetical)
+        are distinct entries.
+
+        **Wildcard mode** — set `all_resource_types: true`. The server returns all
+        permission scopes the subject holds, emitting `type: "*", api_group: "*"` for
+        wildcard rule grants (e.g. admin) and specific type/apiGroup pairs for scoped
+        grants (e.g. MCRA). Consumers map `type: "*"` to "applies to all resource types
+        in my index."
+
+        Exactly one mode must be set. Setting neither returns 400.
+
+        ## Design debate: wildcard mode, PDP vs PIP
+
+        The wildcard mode is architecturally contested and documented here for review.
+
+        **The concern:** Returning `type: "*"` pushes interpretation back to the consumer.
+        A pure PDP returns concrete decisions — consumers are dumb PEPs that just enforce.
+        When a user has admin access (`resources: ["*"]`) the response contains a literal
+        `"*"` which the consumer must interpret as "applies to all types in my index."
+        That interpretation logic belongs in the PDP, not the consumer. The evaluation
+        endpoint handles this correctly — admin on cluster bar returns `decision: true`
+        for any question, with no wildcards exposed.
+
+        **The counter-argument and the deeper insight:** Search and MCP Server are real,
+        production consumers. They need to build a SQL WHERE clause from the user's full
+        permission surface — one predicate that Postgres applies across an unbounded,
+        kind-agnostic result set. This is definitionally PIP semantics, not PDP. You
+        cannot build a SQL WHERE clause from yes/no answers. No matter how the PDP is
+        designed, these consumers need raw permission data — they are structurally PIP
+        consumers. The wildcard mode is ACM's honest acknowledgment of this reality:
+        some architectural needs cannot be satisfied by a PDP, and the AuthZen spec does
+        not provide an answer for them.
+
+        **If you want a pure PDP:** Remove `all_resource_types: true` support. This
+        reduces the endpoint to explicit list mode only — clean PDP semantics, no
+        consumer-side wildcard interpretation. Consumers that need the full permission
+        surface use `GET /apis/clusterview.open-cluster-management.io/v1alpha1/userpermissions`
+        directly, which remains available and unchanged. The wildcard mode is isolated
+        behind the `all_resource_types` flag, so removing it is a surgical change with
+        no impact on the explicit list mode.
+
+        **Current decision:** Wildcard mode is kept to serve Search/MCP Server's
+        bulk permission needs in one HTTP call (vs O(N) calls per resource type).
+        The trade-off is acknowledged: this mode is a PIP helper, not a PDP endpoint.
+
+        ## apiGroup precision in explicit mode
+
+        A wildcard grant (`resources: ["*"], apiGroups: ["*"]`) matches any (type, apiGroup)
+        the caller requests — this is correct. To test apiGroup precision, use a subject
+        whose permissions have specific (non-wildcard) apiGroups, such as a user with
+        an MCRA that specifies `apiGroups: ["", "apps", "batch"]`.
+      operationId: searchResources
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchResourcesRequest"
+            examples:
+              explicit-list:
+                summary: Search for specific resource types (explicit list mode)
+                value:
+                  subject:
+                    type: user
+                    id: alice
+                  action:
+                    name: get
+                  resources:
+                    - type: pods
+                      properties:
+                        apiGroup: ""
+                    - type: deployments
+                      properties:
+                        apiGroup: apps
+                    - type: virtualmachines
+                      properties:
+                        apiGroup: kubevirt.io
+              wildcard:
+                summary: Return all permission scopes (wildcard mode)
+                value:
+                  subject:
+                    type: user
+                    id: alice
+                  action:
+                    name: get
+                  all_resource_types: true
+      responses:
+        "200":
+          description: |
+            Per-type scope lists. In wildcard mode, `type: "*"` and `api_group: "*"`
+            entries represent wildcard grants (e.g. admin) — consumers should apply
+            those scopes to all resource types in their index.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResourcesResponse"
+              examples:
+                admin-wildcard:
+                  summary: Admin user — wildcard mode response
+                  value:
+                    results:
+                      - type: "*"
+                        api_group: "*"
+                        scopes:
+                          - cluster: bar
+                            namespace: "*"
+                          - cluster: baz
+                            namespace: "*"
+                explicit-specific:
+                  summary: MCRA user — explicit list mode
+                  value:
+                    results:
+                      - type: pods
+                        api_group: ""
+                        scopes:
+                          - cluster: bar
+                            namespace: alpha
+                      - type: deployments
+                        api_group: apps
+                        scopes:
+                          - cluster: bar
+                            namespace: alpha
+        "400":
+          description: Bad request — subject.id missing, or neither resources nor all_resource_types set
+          content:
+            text/plain:
+              schema:
+                type: string
+        "401":
+          description: Unauthenticated
+          content:
+            text/plain:
+              schema:
+                type: string
+        "403":
+          description: Caller may not query this subject
+          content:
+            text/plain:
+              schema:
+                type: string
+
 components:
   schemas:
 
@@ -658,6 +849,71 @@ components:
             Note: `false` means no permission was found. It does not distinguish
             between "no permission exists" and "permission was explicitly denied".
             ACM's permission model is additive — there are no explicit deny rules.
+
+    ScopeEntry:
+      type: object
+      required: [cluster, namespace]
+      description: A (cluster, namespace) permission scope.
+      properties:
+        cluster:
+          type: string
+          description: Managed cluster name.
+        namespace:
+          type: string
+          description: Namespace on the managed cluster. `"*"` means cluster-wide access.
+
+    ResourceTypeScopes:
+      type: object
+      required: [type, api_group, scopes]
+      description: |
+        Permission scopes for a single resource type.
+        In wildcard mode responses, `type: "*"` and `api_group: "*"` represent wildcard
+        grants — consumers should apply those scopes to all resource types in their index.
+      properties:
+        type:
+          type: string
+          description: Plural resource name, or `"*"` for wildcard grants.
+        api_group:
+          type: string
+          description: API group, or `"*"` for wildcard grants. `""` = core.
+        scopes:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScopeEntry"
+
+    SearchResourcesRequest:
+      type: object
+      required: [subject, action]
+      description: |
+        **ACM extension — not in AuthZen spec.**
+        Set exactly one of `resources` (explicit list) or `all_resource_types: true` (wildcard).
+      properties:
+        subject:
+          $ref: "#/components/schemas/Subject"
+        action:
+          $ref: "#/components/schemas/Action"
+        resources:
+          type: array
+          description: |
+            Explicit list mode: specific (type, apiGroup) pairs to check.
+            Each item uses `resource.type` and `resource.properties.apiGroup`.
+          items:
+            $ref: "#/components/schemas/Resource"
+        all_resource_types:
+          type: boolean
+          description: |
+            Wildcard mode: return all permission scopes the subject holds across all
+            resource types. Wildcard rule grants emit `type: "*", api_group: "*"`.
+
+    SearchResourcesResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          description: Per-type scope lists. Empty list means no permissions.
+          items:
+            $ref: "#/components/schemas/ResourceTypeScopes"
 
     SearchActionRequest:
       type: object
@@ -830,8 +1086,16 @@ components:
           example: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/evaluations"
         search_resource_endpoint:
           type: string
-          description: Absolute URL of the resource scope search endpoint.
+          description: Absolute URL of the resource scope search endpoint (AuthZen spec, per-type).
           example: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/search/resource"
+        search_action_endpoint:
+          type: string
+          description: Absolute URL of the action search endpoint (AuthZen spec).
+          example: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/search/action"
+        search_resources_endpoint:
+          type: string
+          description: Absolute URL of the bulk resource scope endpoint (ACM extension — not in AuthZen spec).
+          example: "https://ocm-proxyserver.multicluster-engine.svc:443/access/v1/search/resources"
 
   securitySchemes:
     BearerToken:

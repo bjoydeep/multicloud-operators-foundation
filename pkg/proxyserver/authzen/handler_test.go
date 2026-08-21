@@ -18,11 +18,12 @@ import (
 
 // mockDecider is a controllable Decider for handler tests.
 type mockDecider struct {
-	evaluateResult      bool
-	evaluateBatchResult []bool
-	searchResult        []Scope
-	searchActionResult  []string
-	err                 error
+	evaluateResult        bool
+	evaluateBatchResult   []bool
+	searchResult          []Scope
+	searchActionResult    []string
+	searchResourcesResult []ResourceTypeScopes
+	err                   error
 }
 
 func (m *mockDecider) Evaluate(_ context.Context, _ user.Info, _ Action, _ Resource) (bool, error) {
@@ -36,6 +37,9 @@ func (m *mockDecider) SearchResource(_ context.Context, _ user.Info, _ Action, _
 }
 func (m *mockDecider) SearchAction(_ context.Context, _ user.Info, _ Resource) ([]string, error) {
 	return m.searchActionResult, m.err
+}
+func (m *mockDecider) SearchResources(_ context.Context, _ user.Info, _ Action, _ []Resource, _ bool) ([]ResourceTypeScopes, error) {
+	return m.searchResourcesResult, m.err
 }
 
 // requestWithUser injects a user.Info into the request context (simulates the auth middleware).
@@ -359,6 +363,75 @@ func TestSearchResource_BadRequestOnMissingResourceType(t *testing.T) {
 	r := requestWithUser(postRequest(t, "/access/v1/search/resource", body), "alice", nil)
 	w := httptest.NewRecorder()
 	h.SearchResource(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// --- SearchResources ---
+
+func TestSearchResources_ExplicitMode_ReturnsResults(t *testing.T) {
+	mockResults := []ResourceTypeScopes{
+		{Type: "pods", APIGroup: "", Scopes: []ScopeEntry{{Cluster: "bar", Namespace: "*"}}},
+		{Type: "deployments", APIGroup: "apps", Scopes: []ScopeEntry{{Cluster: "bar", Namespace: "*"}}},
+	}
+	h := NewHandler(&mockDecider{searchResourcesResult: mockResults}, nil)
+	body := SearchResourcesRequest{
+		Subject: Subject{Type: "user", ID: "alice"},
+		Action:  Action{Name: "get"},
+		Resources: []Resource{
+			{Type: "pods", Properties: map[string]string{"apiGroup": ""}},
+			{Type: "deployments", Properties: map[string]string{"apiGroup": "apps"}},
+		},
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/search/resources", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.SearchResources(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp SearchResourcesResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Results) != 2 {
+		t.Errorf("expected 2 results, got %d", len(resp.Results))
+	}
+}
+
+func TestSearchResources_WildcardMode_ReturnsResults(t *testing.T) {
+	mockResults := []ResourceTypeScopes{
+		{Type: "*", APIGroup: "*", Scopes: []ScopeEntry{{Cluster: "bar", Namespace: "*"}}},
+	}
+	h := NewHandler(&mockDecider{searchResourcesResult: mockResults}, nil)
+	body := SearchResourcesRequest{
+		Subject:          Subject{Type: "user", ID: "alice"},
+		Action:           Action{Name: "get"},
+		AllResourceTypes: true,
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/search/resources", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.SearchResources(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp SearchResourcesResponse
+	_ = json.NewDecoder(w.Body).Decode(&resp)
+	if len(resp.Results) != 1 || resp.Results[0].Type != "*" {
+		t.Errorf("expected wildcard result, got %+v", resp.Results)
+	}
+}
+
+func TestSearchResources_BadRequest_NeitherModeSet(t *testing.T) {
+	h := NewHandler(&mockDecider{}, nil)
+	body := SearchResourcesRequest{
+		Subject: Subject{Type: "user", ID: "alice"},
+		Action:  Action{Name: "get"},
+		// neither Resources nor AllResourceTypes set
+	}
+	r := requestWithUser(postRequest(t, "/access/v1/search/resources", body), "alice", nil)
+	w := httptest.NewRecorder()
+	h.SearchResources(w, r)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", w.Code)
 	}

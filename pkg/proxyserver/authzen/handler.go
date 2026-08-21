@@ -41,6 +41,8 @@ func (h *Handler) Discovery(w http.ResponseWriter, r *http.Request) {
 		"access_evaluations_endpoint": base + "/access/v1/evaluations",
 		"search_resource_endpoint":    base + "/access/v1/search/resource",
 		"search_action_endpoint":      base + "/access/v1/search/action",
+		"search_resources_endpoint":             base + "/access/v1/search/resources",
+		"search_resources_endpoint_note":        "ACM extension — not defined in AuthZen Authorization API 1.0 spec",
 		"resource_type_convention":    "resource_name_only",
 		"resource_type_description":   "resource.type is the plural resource name (e.g. pods, deployments, virtualmachines). API group is carried in resource.properties.apiGroup.",
 	})
@@ -172,6 +174,45 @@ func (h *Handler) SearchResource(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, resp)
+}
+
+// SearchResources serves POST /access/v1/search/resources (bulk resource scope query).
+// Two modes controlled by the request body:
+//   - resources: explicit list — returns scopes for each named (type, apiGroup)
+//   - all_resource_types: true — wildcard, returns all permission scopes the subject holds
+func (h *Handler) SearchResources(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req SearchResourcesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Subject.ID == "" {
+		http.Error(w, "subject.id is required", http.StatusBadRequest)
+		return
+	}
+	if !req.AllResourceTypes && len(req.Resources) == 0 {
+		http.Error(w, "either resources or all_resource_types:true is required", http.StatusBadRequest)
+		return
+	}
+	callerInfo, ok := request.UserFrom(r.Context())
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !h.callerCanQuerySubject(r.Context(), callerInfo, req.Subject) {
+		http.Error(w, "forbidden: caller may only query their own permissions", http.StatusForbidden)
+		return
+	}
+	results, err := h.decider.SearchResources(r.Context(), subjectUserInfo(req.Subject, callerInfo), req.Action, req.Resources, req.AllResourceTypes)
+	if err != nil {
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, SearchResourcesResponse{Results: results})
 }
 
 // SearchAction serves POST /access/v1/search/action.

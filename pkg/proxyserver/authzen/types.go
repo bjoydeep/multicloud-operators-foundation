@@ -97,6 +97,36 @@ type SearchResult struct {
 	Properties map[string]string `json:"properties"`
 }
 
+// ScopeEntry is a (cluster, namespace) pair used in bulk resource responses.
+// Namespace "*" means cluster-wide access.
+type ScopeEntry struct {
+	Cluster   string `json:"cluster"`
+	Namespace string `json:"namespace"`
+}
+
+// ResourceTypeScopes is a single resource type's permission scopes in a bulk response.
+type ResourceTypeScopes struct {
+	Type     string       `json:"type"`     // plural resource name, or "*" for wildcard
+	APIGroup string       `json:"api_group"` // "" = core, "*" = wildcard
+	Scopes   []ScopeEntry `json:"scopes"`
+}
+
+// SearchResourcesRequest is the body of POST /access/v1/search/resources (bulk).
+// Two modes — set exactly one:
+//   - Resources: explicit list of (type, apiGroup) pairs to check
+//   - AllResourceTypes: wildcard — return scopes for everything the subject can access
+type SearchResourcesRequest struct {
+	Subject          Subject    `json:"subject"`
+	Action           Action     `json:"action"`
+	Resources        []Resource `json:"resources,omitempty"`
+	AllResourceTypes bool       `json:"all_resource_types,omitempty"`
+}
+
+// SearchResourcesResponse is returned by the search/resources endpoint.
+type SearchResourcesResponse struct {
+	Results []ResourceTypeScopes `json:"results"`
+}
+
 // SearchActionRequest is the body of POST /access/v1/search/action.
 // Answers: what actions can subject perform on this specific resource?
 // resource.properties.cluster, namespace, and apiGroup are all required.

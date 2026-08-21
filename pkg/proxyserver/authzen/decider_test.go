@@ -299,6 +299,113 @@ func TestSearchResource_NamespacedBindingFilteredByResourceType(t *testing.T) {
 	}
 }
 
+// --- SearchResources ---
+
+func TestSearchResources_ExplicitList(t *testing.T) {
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{adminPermission("bar")},
+	}})
+	resources := []Resource{
+		{Type: "pods", Properties: map[string]string{"apiGroup": ""}},
+		{Type: "deployments", Properties: map[string]string{"apiGroup": "apps"}},
+	}
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, resources, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// admin has access to both — should get 2 results
+	if len(results) != 2 {
+		t.Errorf("expected 2 results, got %d: %+v", len(results), results)
+	}
+}
+
+func TestSearchResources_ExplicitList_ApiGroupPrecision(t *testing.T) {
+	// User has access to kubevirt.io virtualmachines but NOT core pods (specific apiGroups, not wildcard)
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"kubevirt.io"}, Resources: []string{"virtualmachines"}, Verbs: []string{"get"}},
+	}
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{namespacedPermission("bar", []string{"alpha"}, rules)},
+	}})
+	resources := []Resource{
+		{Type: "pods", Properties: map[string]string{"apiGroup": ""}},                       // no access — wrong apiGroup
+		{Type: "virtualmachines", Properties: map[string]string{"apiGroup": "kubevirt.io"}}, // has access
+		{Type: "pods", Properties: map[string]string{"apiGroup": "kubevirt.io"}},            // no access — pods not in kubevirt.io
+	}
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, resources, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only virtualmachines.kubevirt.io should appear — apiGroup precision enforced
+	// Admin (wildcard) would match everything, but this user has specific rules
+	if len(results) != 1 {
+		t.Errorf("expected 1 result (kubevirt virtualmachines only), got %d: %+v", len(results), results)
+	}
+	if results[0].Type != "virtualmachines" || results[0].APIGroup != "kubevirt.io" {
+		t.Errorf("unexpected result: %+v", results[0])
+	}
+}
+
+func TestSearchResources_WildcardMode_AdminEmitsWildcardEntries(t *testing.T) {
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{adminPermission("bar")},
+	}})
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Admin rule: resources=["*"], apiGroups=["*"] → should emit type="*", api_group="*"
+	found := false
+	for _, r := range results {
+		if r.Type == "*" && r.APIGroup == "*" {
+			found = true
+			if len(r.Scopes) == 0 {
+				t.Error("wildcard entry should have scopes")
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected wildcard entry type='*' api_group='*', got: %+v", results)
+	}
+}
+
+func TestSearchResources_WildcardMode_SpecificRulesEmitSpecificTypes(t *testing.T) {
+	rules := []rbacv1.PolicyRule{
+		{APIGroups: []string{"kubevirt.io"}, Resources: []string{"virtualmachines"}, Verbs: []string{"get"}},
+	}
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{namespacedPermission("bar", []string{"alpha"}, rules)},
+	}})
+	results, err := d.SearchResources(ctx, alice, Action{Name: "get"}, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d: %+v", len(results), results)
+	}
+	if results[0].Type != "virtualmachines" || results[0].APIGroup != "kubevirt.io" {
+		t.Errorf("unexpected: %+v", results[0])
+	}
+	if len(results[0].Scopes) != 1 || results[0].Scopes[0].Cluster != "bar" {
+		t.Errorf("unexpected scopes: %+v", results[0].Scopes)
+	}
+}
+
+func TestSearchResources_WildcardMode_VerbFiltered(t *testing.T) {
+	// view permission — get/list/watch only
+	d := NewUserPermissionDecider(&mockLister{perms: &clusterviewv1alpha1.UserPermissionList{
+		Items: []clusterviewv1alpha1.UserPermission{viewPermission("bar")},
+	}})
+	// asking for "create" — view doesn't grant it, so no results
+	results, err := d.SearchResources(ctx, alice, Action{Name: "create"}, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Errorf("view permission should not grant create; got %+v", results)
+	}
+}
+
 // --- SearchAction ---
 
 func TestSearchAction_AdminReturnsAllVerbs(t *testing.T) {
