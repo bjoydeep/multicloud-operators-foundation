@@ -130,11 +130,14 @@ preflight() {
   UP_JSON=$(kubectl get userpermissions -o json 2>/dev/null)
   ADMIN_CLUSTERS=$(echo "$UP_JSON" | python3 -c "
 import json,sys
+# Exclude clusters unrelated to this test setup
+EXCLUDED = {'subbarao-hub'}
 data=json.load(sys.stdin)
 for item in data['items']:
     if item['metadata']['name'] == 'managedcluster:admin':
         for b in item['status'].get('bindings',[]):
-            print(b['cluster'])
+            if b['cluster'] not in EXCLUDED:
+                print(b['cluster'])
 " 2>/dev/null)
 
   if [ -z "$ADMIN_CLUSTERS" ]; then

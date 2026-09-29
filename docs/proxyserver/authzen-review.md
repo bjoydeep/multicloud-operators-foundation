@@ -290,6 +290,84 @@ Specific answers to prepare:
 
 ---
 
+## Multi-Tenancy Analysis
+
+### Request isolation — what is already correct
+
+Each API request is fully isolated:
+
+- **Bearer token → DelegatingAuthenticationOptions → user identity per request.** Every request is independently authenticated against the hub kube-apiserver via TokenReview. No shared session state between callers.
+- **`callerCanQuerySubject` enforces you can only see your own permissions** (or subjects you have impersonate rights for). A caller from Tenant-A cannot query Tenant-B's users' permissions without explicit Kubernetes impersonate RBAC grants — which a correctly configured MSP deployment would never grant cross-tenant.
+- **The `userpermission.Cache` is shared read-only.** No mutation per request, no cross-user data leakage. `cache.List(userInfo)` scopes the lookup to the caller's identity — name + groups — and returns only that user's permissions.
+
+**Rate limiting** is the one gap: one tenant could flood the API and starve others. The GenericAPIServer provides global limiting, but per-user or per-tenant rate limiting is not implemented. For POC this is acceptable; for production it is worth noting.
+
+**Cache staleness** is consistent across tenants: all callers share the same 2-second informer resync. If Alice's permissions change, she sees the update within ~2 seconds. This is uniform — no tenant gets preferential freshness.
+
+**Verdict: Request-level multi-tenancy is handled. Rate limiting is the one production gap.**
+
+---
+
+### The group name collision problem in MSP deployments
+
+The deeper multi-tenancy concern is **identity, not the API itself**. The `userpermission.Cache` indexes permissions by the literal string values in the OIDC `groups` claim. If two tenants both have a group called `admins` and both strings reach the cache as `"admins"`, they collide in the `groupStore` — Tenant-A's `admins` bindings and Tenant-B's `admins` bindings merge under the same key.
+
+This is not introduced by the AuthZen API — it exists identically in the current `userpermissions` CRD endpoint. The API inherits whatever isolation the identity provider provides.
+
+**Why this is realistic for an MSP:** An MSP running ACM for multiple customers on one hub with one IDP (e.g., Keycloak, EntraID, Google Auth) will likely have each tenant configure their own groups using simple names like `admins`, `developers`, `read-only`. These names are completely logical and expected — the MSP's job is to ensure the IDP emits tenant-qualified strings in the token.
+
+---
+
+### How single-IDP multi-tenancy is solved correctly
+
+**Pattern 1 — Keycloak Realms (most common for MSP)**
+
+Keycloak has *realms* — completely isolated namespaces within one Keycloak instance. Each tenant gets their own realm:
+
+```
+keycloak.msp.com/realms/acme-corp   → acme's users and groups
+keycloak.msp.com/realms/globex      → globex's users and groups
+```
+
+Both tenants have a group called `admins`. The OIDC token's `iss` (issuer) claim contains the realm URL, so OpenShift sees two distinct OIDC providers even though it is one Keycloak instance:
+
+```yaml
+identityProviders:
+- name: acme-idp
+  type: OpenID
+  openID:
+    issuer: https://keycloak.msp.com/realms/acme-corp
+- name: globex-idp
+  type: OpenID
+  openID:
+    issuer: https://keycloak.msp.com/realms/globex
+```
+
+OpenShift prefixes usernames with the IDP name (`acme-idp:alice`, `globex-idp:alice`). **However, groups from the OIDC `groups` claim are used as-is** — `admins` from both realms still collides in the cache. The fix: configure Keycloak's group mapper to return the full group path including the realm or a tenant prefix: `/acme-corp/admins` instead of `admins`.
+
+**Pattern 2 — EntraID / Azure AD (GUIDs solve it automatically)**
+
+Azure AD groups are identified by GUID in the token, not by display name. Tenant-A's `admins` and Tenant-B's `admins` are different Azure AD tenants with different GUIDs and different `tid` claims — no collision by construction. This is why enterprise Microsoft environments do not have this problem by default.
+
+**Pattern 3 — Claims mapping / group prefix injection**
+
+Any IDP can be configured to inject a tenant identifier into the `groups` claim at token-generation time. In Keycloak, a Protocol Mapper on the client takes a hardcoded attribute (e.g., `tenant_id = "acme"`) and prepends it to all group names. The token claim becomes `["acme:admins", "acme:developers"]` instead of `["admins", "developers"]`. The MSP configures this mapper per tenant's Keycloak client — result: `acme:admins` and `globex:admins` never collide in the cache.
+
+---
+
+### What the AuthZen API must document as a deployment prerequisite
+
+The API does not enforce or validate tenant isolation. Correct multi-tenant operation requires that the identity provider emits **tenant-qualified group names** in the OIDC `groups` claim. The two clean approaches for a Keycloak-based MSP:
+
+1. Keycloak realm per tenant + group path mapper returning `/realm-name/group-name`
+2. Protocol mapper per tenant client injecting `tenant_id:group_name` format
+
+Without one of these, group name collisions in the `userpermission.Cache` will cause cross-tenant permission leakage — a user in Tenant-A seeing permissions that were granted to Tenant-B's group with the same name.
+
+**This is a deployment configuration concern, not an API defect.** The same constraint applies to the existing `userpermissions` CRD endpoint and to any Kubernetes RBAC that uses group-based bindings.
+
+---
+
 ## Strategic Argument for Migration
 
 Consumer reviews (search-v2-api, search-mcp-server) raise valid concerns about migration

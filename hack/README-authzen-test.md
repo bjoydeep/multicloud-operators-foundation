@@ -3,51 +3,69 @@
 This directory contains scripts to set up and test the AuthZen Authorization API 1.0
 endpoints added to `ocm-proxyserver` as part of DDR-083 Phase 3.
 
-**Related:** `~/code/acm-discovery/userpermission/implementation-plan-authzen.md`
-
 ---
 
 ## Scripts
 
-| Script | Purpose | Run |
-|--------|---------|-----|
+| Script | Purpose | When |
+|--------|---------|------|
 | `setup-authzen-users.sh` | HTPasswd IDP + alice/bob/carol User objects | Once per cluster |
 | `setup-authzen-rbac.sh` | RoleBindings + discoverable ClusterRoles + MCRAs | Once per cluster |
 | `test-authzen.sh` | Smoke tests for all AuthZen endpoints | Each dev session |
 
 ---
 
-## Gotcha — adding new endpoints
+## Step 1 — Prerequisites
 
-When a new AuthZen endpoint is added, the `authzen-test:client` and
-`authzen-test:impersonator` ClusterRoles must be updated to include the new
-non-resource URL — otherwise test users get a DelegatingAuthorization 403 before
-the request even reaches the handler.
-
-Both roles are defined in `setup-authzen-rbac.sh` under the `nonResourceURLs` list.
-Patch them on the live cluster if already deployed:
+The `fine-grained-rbac` feature gate must be enabled in MultiClusterHub. This deploys
+the MCRA controller (`multicluster-role-assignment-controller`) — without it, MCRAs
+exist as objects but nothing reconciles them into ClusterPermissions.
 
 ```bash
-kubectl patch clusterrole authzen-test:client \
-  --type=json \
-  -p='[{"op":"add","path":"/rules/1/nonResourceURLs/-","value":"/access/v1/search/newpath"}]'
+# Check current state
+kubectl get multiclusterhub multiclusterhub -n open-cluster-management \
+  -o jsonpath='{.spec.overrides.components[?(@.name=="fine-grained-rbac")].enabled}'
 
-kubectl patch clusterrole authzen-test:impersonator \
-  --type=json \
-  -p='[{"op":"add","path":"/rules/1/nonResourceURLs/-","value":"/access/v1/search/newpath"}]'
+# Enable if false
+kubectl get multiclusterhub multiclusterhub -n open-cluster-management -o json | python3 -c "
+import json,sys
+mch=json.load(sys.stdin)
+for c in mch['spec']['overrides']['components']:
+    if c['name'] == 'fine-grained-rbac':
+        c['enabled'] = True
+print(json.dumps(mch))
+" | kubectl apply -f -
 ```
+
+Wait for MCH to return to `Running` phase before proceeding to Step 2.
 
 ---
 
-## Dev session workflow
+## Step 2 — One-time cluster setup
 
-The MCE operator continuously reconciles the `MultiClusterEngine` CR and reverts any
-manual changes to the `ocm-proxyserver` deployment. Pause it via annotation — cleaner
-than scaling to 0 because the operator keeps running and manages all other MCE components
-normally.
+Run these once. Both scripts are idempotent — safe to re-run.
 
-The dev loop below is the **complete sequence** every iteration. Steps 3 and 4 are
-one-time per cluster session — skip them if already done.
+```bash
+# Create HTPasswd IDP and test users (alice, bob, carol)
+./hack/setup-authzen-users.sh
+
+# Create RBAC, discoverable ClusterRoles, and MCRAs
+./hack/setup-authzen-rbac.sh
+```
+
+After `setup-authzen-rbac.sh` completes, verify the cache has warmed up:
+
+```bash
+kubectl get userpermissions --as=alice
+kubectl get userpermissions --as=bob
+kubectl get userpermissions --as=carol
+```
+
+If results are empty, wait 30 seconds and retry.
+
+---
+
+## Step 3 — Dev session workflow
 
 ```bash
 # 1. Build (you changed the code — always start here)
@@ -85,56 +103,7 @@ kubectl annotate multiclusterengine multiclusterengine installer.multicluster.op
 
 ---
 
-## Prerequisites
-
-### 1. `fine-grained-rbac` feature gate must be enabled in MultiClusterHub
-
-The MCRA controller (`multicluster-role-assignment-controller`) is only deployed when
-this feature gate is on. The CRD ships regardless, so MCRAs can be created but nothing
-reconciles them until the feature is enabled.
-
-```bash
-# Check current state
-kubectl get multiclusterhub multiclusterhub -n open-cluster-management \
-  -o jsonpath='{.spec.overrides.components[?(@.name=="fine-grained-rbac")].enabled}'
-
-# Enable if false
-kubectl get multiclusterhub multiclusterhub -n open-cluster-management -o json | python3 -c "
-import json,sys
-mch=json.load(sys.stdin)
-for c in mch['spec']['overrides']['components']:
-    if c['name'] == 'fine-grained-rbac':
-        c['enabled'] = True
-print(json.dumps(mch))
-" | kubectl apply -f -
-```
-
-Wait for MCH to return to `Running` phase after enabling.
-
-### 2. MCRAs use Placements for cluster selection
-
-`MulticlusterRoleAssignment.spec.roleAssignments[].clusterSelection` only supports
-`type: placements` — it cannot name clusters directly. The setup script creates:
-
-- A `ManagedClusterSetBinding` in each cluster namespace (binds `global` clusterset)
-- A `Placement` per cluster (selects by `name: <cluster>` label)
-
-The `global` ManagedClusterSet automatically includes all clusters.
-
-### 3. Test users need access to the userpermissions API and AuthZen endpoints
-
-The `ocm-proxyserver` uses `DelegatingAuthorizationOptions`, which enforces authorization
-for **all** paths including non-resource URLs like `/access/v1/evaluation`. Without a
-ClusterRole granting this, test user requests are rejected with 403 before reaching the
-AuthZen handler.
-
-`setup-authzen-rbac.sh` creates `authzen-test:client` ClusterRole covering:
-- `clusterview.open-cluster-management.io/userpermissions` get/list
-- `/access/v1/*` and `/.well-known/authzen-configuration` non-resource URLs
-
----
-
-## Permission matrix
+## Reference — Permission matrix
 
 ### Why hub-only?
 
@@ -179,21 +148,15 @@ coverage case.
 
 ### Namespace rationale
 
-Three namespaces are used for MCRA scoping:
-
 | Namespace | Exists on clusters? | Purpose |
 |-----------|---------------------|---------|
 | `app-frontend` | No (fake) | Tests that permission evaluation is based on the permission record, not namespace existence |
 | `app-backend` | No (fake) | Same as above |
 | `openshift-monitoring` | Yes (real, all clusters) | Tests the realistic case; also verifies that out-of-scope real namespaces are correctly denied |
 
-This mix is intentional: a real namespace that's in-scope (allowed) sits alongside
-real namespaces that are out-of-scope (denied), which catches any "namespace exists
-therefore allow" bug in the decision engine.
-
 ---
 
-## Expected AuthZen decisions
+## Reference — Expected AuthZen decisions
 
 ### alice
 
@@ -217,7 +180,6 @@ therefore allow" bug in the decision engine.
 | get | pods | dsf-mc | openshift-monitoring | ❌ false | not in bob's dsf-mc MCRA |
 | get | pods | dsf-mc-02 | openshift-monitoring | ✅ true | MCRA in-scope (real ns) |
 | create | pods | dsf-mc-02 | openshift-monitoring | ❌ false | workload-view (no write) |
-| get | pods | dsf-mc-02 | app-frontend | ❌ false | out of MCRA scope |
 | get | pods | local-cluster | default | ❌ false | no access |
 | search/resource pods | — | — | — | dsf-mc/app-frontend, dsf-mc/app-backend, dsf-mc-02/openshift-monitoring | 3 scopes total |
 
@@ -237,7 +199,7 @@ therefore allow" bug in the decision engine.
 
 ---
 
-## Discoverable ClusterRoles created
+## Reference — Discoverable ClusterRoles
 
 Two custom ClusterRoles are created by `setup-authzen-rbac.sh`:
 
@@ -265,16 +227,41 @@ not appear in the UserPermission cache and AuthZen would return false.
 
 ---
 
-## Known cluster-specific notes (this cluster)
+## Gotcha — after an ACM/MCE upgrade
 
-- `local-cluster` is the hub, self-imported as a managed cluster — appears in
-  userpermissions alongside dsf-mc and dsf-mc-02
-- `imagePullPolicy: Always` is set on ocm-proxyserver deployment (prevents stale
-  image caching when reusing the `:dev` tag)
-- RBAC patch for TLS profile watcher is needed each session: the MCE 2.11.4 ClusterRole
-  predates the `config.openshift.io/apiservers` rule added in PR #1236
+An upgrade un-pauses the MCE operator and resets the `ocm-proxyserver` deployment back
+to the release image. After an upgrade, run the full restore sequence:
 
-## Implementation notes relevant to DDR-083 review
+```bash
+# 1. Re-pause MCE operator
+kubectl annotate multiclusterengine multiclusterengine \
+  installer.multicluster.openshift.io/pause=true --overwrite
+
+# 2. Re-apply RBAC patch (upgrade reverts it)
+kubectl get clusterrole open-cluster-management:backplane:foundation -o json | \
+  python3 -c "import json,sys; rules=json.load(sys.stdin)['rules']; \
+  print('PRESENT' if any('config.openshift.io' in r.get('apiGroups',[]) for r in rules) else 'MISSING')"
+# Apply if MISSING:
+kubectl patch clusterrole open-cluster-management:backplane:foundation \
+  --type=json \
+  -p='[{"op":"add","path":"/rules/-","value":{"apiGroups":["config.openshift.io"],"resources":["apiservers"],"verbs":["get","list","watch"]}}]'
+
+# 3. Reset deployment image (rollout restart alone is not enough — spec was reset too)
+kubectl set image deployment/ocm-proxyserver \
+  -n multicluster-engine \
+  ocm-proxyserver=quay.io/bjoydeep/multicloud-manager:dev
+kubectl patch deployment ocm-proxyserver -n multicluster-engine \
+  --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]'
+kubectl rollout status deployment/ocm-proxyserver -n multicluster-engine --timeout=120s
+```
+
+A `rollout restart` alone is not sufficient after an upgrade — the deployment spec has
+already been reset to the release image, so restarting just re-pulls the release image.
+
+---
+
+## Implementation notes
 
 ### Group-based permissions must use the caller's full user.Info
 
@@ -284,17 +271,11 @@ permissions come entirely via group bindings (e.g. `system:cluster-admins`), pas
 the username with no groups would cause the cache lookup to return empty — resulting in
 incorrect `{"decision":false}` responses.
 
-The handler extracts the caller's full `user.Info` from the request context (populated by
-the DelegatingAuthenticationOptions middleware, which includes all groups from TokenReview)
-and passes it to the Decider. This is covered by `TestEvaluate_GroupBasedPermission` in
-`pkg/proxyserver/authzen/decider_test.go`.
-
 ### Fake namespaces in MCRA scope work correctly
 
 MCRA/ClusterPermission records namespace names in the hub-side cache regardless of whether
 those namespaces exist on the managed cluster. The AuthZen decision engine evaluates against
-the cache — it has no knowledge of actual namespace existence on managed clusters. This is
-correct behaviour: the permission grant is what matters, not namespace existence.
+the cache — it has no knowledge of actual namespace existence on managed clusters.
 
 The MCRA controller will fail to create the RoleBinding on the managed cluster (namespace
 not found), but the hub-side ClusterPermission is created and the `discoverablePermissionProcessor`
