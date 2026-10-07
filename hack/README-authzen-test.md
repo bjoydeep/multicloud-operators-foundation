@@ -11,6 +11,7 @@ endpoints added to `ocm-proxyserver` as part of DDR-083 Phase 3.
 |--------|---------|------|
 | `setup-authzen-users.sh` | HTPasswd IDP + alice/bob/carol User objects | Once per cluster |
 | `setup-authzen-rbac.sh` | RoleBindings + discoverable ClusterRoles + MCRAs | Once per cluster |
+| `setup-authzen-fake-clusters.sh` | Fake ManagedClusters for single-hub clusters | Conditional — see Step 2b |
 | `test-authzen.sh` | Smoke tests for all AuthZen endpoints | Each dev session |
 
 ---
@@ -53,7 +54,27 @@ Run these once. Both scripts are idempotent — safe to re-run.
 ./hack/setup-authzen-rbac.sh
 ```
 
-After `setup-authzen-rbac.sh` completes, verify the cache has warmed up:
+### Step 2b — Conditional: fake managed clusters (single-hub clusters only)
+
+The test setup targets three clusters: `dsf-mc`, `dsf-mc-02`, and `local-cluster`. If
+your hub only has `local-cluster` (common on workshop or single-node clusters), run:
+
+```bash
+# Check first — if dsf-mc and dsf-mc-02 appear, skip this step
+kubectl get managedcluster
+
+# If they are missing, create fake ones
+./hack/setup-authzen-fake-clusters.sh
+```
+
+The script is **safe to run on any cluster** — it checks before creating anything and
+skips clusters that already exist. It prints reverse commands at the end so you know
+exactly what to clean up.
+
+---
+
+After `setup-authzen-rbac.sh` (and optionally `setup-authzen-fake-clusters.sh`) complete,
+verify the cache has warmed up:
 
 ```bash
 kubectl get userpermissions --as=alice
